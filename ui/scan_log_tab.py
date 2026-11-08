@@ -222,7 +222,7 @@ class ScanLogTab(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "发送", str(e))
             return
-        if (self.worker.enabled or self.worker.streaming) and P.is_special(data.ljust(8, b"\0")):
+        if self.worker.enabled and P.is_special(data.ljust(8, b"\0")):
             if QMessageBox.question(self, "发送", "电机使能中，确认发送模式切换帧？") != QMessageBox.Yes:
                 return
         self.worker.send_raw(cid, data)

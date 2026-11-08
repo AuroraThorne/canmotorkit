@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
                                QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
-COLS = ["t", "p_cmd", "p_fb", "v_cmd", "v_fb", "t_cmd", "t_fb", "t_mos", "t_rotor", "code", "streaming"]
+COLS = ["t", "p_cmd", "p_fb", "v_cmd", "v_fb", "t_cmd", "t_fb", "t_mos", "t_rotor", "code", "mit"]
 
 
 class Ring:
@@ -114,10 +114,10 @@ class PlotWidget(QWidget):
         nan = math.nan
         rows = np.array([
             (s.t - self.t0,
-             s.cmd.p if s.streaming else nan, s.st.pos,
-             s.cmd.v if s.streaming else nan, s.st.vel,
-             s.cmd.t if s.streaming else nan, s.st.torque,
-             s.st.t_mos, s.st.t_rotor, s.st.err, 1.0 if s.streaming else 0.0)
+             s.cmd.p if s.mit else nan, s.st.pos,
+             s.cmd.v if s.mit else nan, s.st.vel,
+             s.cmd.t if s.mit else nan, s.st.torque,
+             s.st.t_mos, s.st.t_rotor, s.st.err, 1.0 if s.mit else 0.0)
             for s in samples], dtype=float)
         self.ring.extend(rows)
         self._dirty = True

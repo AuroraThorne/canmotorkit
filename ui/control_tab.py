@@ -1,9 +1,9 @@
-"""MIT 控制面板：使能/失能/急停/清错/设零、周期下发开关、五参数（手动应用）、实时读数。
+"""MIT 控制面板：使能/失能/急停/清错/设零、五参数（手动应用）、实时读数、通信频率。
 
 约定：
 - 参数默认全 0；修改后必须点“应用”（或回车）才写入下发目标，没有自动更新。
 - 使能/失能按钮不锁定，电机是否使能以状态帧状态码为准。
-- “周期下发”独立开关：打开才发 MIT 帧。
+- 按通信频率发帧：电机已使能发 MIT 控制帧，否则发 0xCC 查询帧。
 """
 from __future__ import annotations
 
@@ -101,12 +101,11 @@ class _Row:
 
 
 class ControlPanel(QGroupBox):
-    rate_changed = Signal(float, float)     # 周期下发频率, 状态轮询频率
+    rate_changed = Signal(float)            # 通信频率
 
     def __init__(self, parent=None):
         super().__init__("MIT 控制", parent)
         self.worker = None
-        self._streaming = False
 
         def btn(text, style="", h=28):
             b = QPushButton(text)
@@ -118,16 +117,11 @@ class ControlPanel(QGroupBox):
 
         self.btn_enable = btn("使能 (FC)")
         self.btn_disable = btn("失能 (FD)")
-        self.btn_stream = btn("周期下发：关")
-        self.btn_stream.setCheckable(True)
-        self.btn_stream.setStyleSheet("QPushButton:checked{background:#2e7d32;color:white;font-weight:bold}")
-        self.btn_stream.setToolTip("打开后按频率发送 MIT 控制帧（发送的是已应用的参数）；\n"
-                                   "关闭时用 0xCC 查询状态。失能/急停会自动关闭。")
         self.btn_estop = btn("急停  [Esc / 空格]", "QPushButton{background:#c62828;color:white;"
                                                    "font-weight:bold;font-size:15px}", h=40)
         self.btn_clear = btn("清错 (FB)")
         self.btn_zero = btn("设零点 (FE)")
-        self.btn_zero.setToolTip("将当前输出轴位置设为零点（需失能且关闭周期下发）")
+        self.btn_zero.setToolTip("将当前输出轴位置设为零点（需失能）")
         self.lbl_motor = QLabel("电机状态：—")
         self.lbl_motor.setAlignment(Qt.AlignCenter)
         self.lbl_motor.setMinimumHeight(26)
@@ -136,10 +130,9 @@ class ControlPanel(QGroupBox):
         top.addWidget(self.lbl_motor, 0, 0, 1, 2)
         top.addWidget(self.btn_enable, 1, 0)
         top.addWidget(self.btn_disable, 1, 1)
-        top.addWidget(self.btn_stream, 2, 0, 1, 2)
-        top.addWidget(self.btn_clear, 3, 0)
-        top.addWidget(self.btn_zero, 3, 1)
-        top.addWidget(self.btn_estop, 4, 0, 1, 2)
+        top.addWidget(self.btn_clear, 2, 0)
+        top.addWidget(self.btn_zero, 2, 1)
+        top.addWidget(self.btn_estop, 3, 0, 1, 2)
 
         # 参数
         pg = QGroupBox("目标参数（修改后点“应用”或按回车生效）")
@@ -172,19 +165,16 @@ class ControlPanel(QGroupBox):
         fg = QGroupBox("通信")
         ff = QFormLayout(fg)
         self.sp_rate = QSpinBox()
-        self.sp_rate.setRange(50, 1000)
+        self.sp_rate.setRange(10, 1000)
         self.sp_rate.setValue(200)
         self.sp_rate.setSuffix(" Hz")
-        self.sp_poll = QSpinBox()
-        self.sp_poll.setRange(0, 200)
-        self.sp_poll.setValue(50)
-        self.sp_poll.setSuffix(" Hz")
-        self.sp_poll.setToolTip("周期下发关闭时用 0xCC 查询状态的频率，0 = 不查询")
+        self.sp_rate.setToolTip("电机已使能时为 MIT 控制帧频率，未使能时为 0xCC 查询帧频率")
+        self.lbl_frame = QLabel("—")
         self.lbl_rate = QLabel("—")
         self.lbl_lim = QLabel("—")
         self.lbl_lim.setWordWrap(True)
-        ff.addRow("周期下发频率", self.sp_rate)
-        ff.addRow("状态轮询（不下发时）", self.sp_poll)
+        ff.addRow("通信频率（MIT/查询）", self.sp_rate)
+        ff.addRow("当前发送", self.lbl_frame)
         ff.addRow("实际发送频率", self.lbl_rate)
         ff.addRow("当前量程", self.lbl_lim)
 
@@ -204,14 +194,13 @@ class ControlPanel(QGroupBox):
         lay = QVBoxLayout(self)
         lay.addLayout(top)
         lay.addWidget(pg)
-        lay.addWidget(fg)
         lay.addWidget(rg)
+        lay.addWidget(fg)
         lay.addStretch(1)
 
         self.set_limits(P.DEFAULT_LIMITS, False)
         self.btn_enable.clicked.connect(lambda: self.worker and self.worker.enable())
         self.btn_disable.clicked.connect(lambda: self.worker and self.worker.disable())
-        self.btn_stream.clicked.connect(self._stream_clicked)
         self.btn_estop.clicked.connect(self.estop)
         self.btn_clear.clicked.connect(lambda: self.worker and self.worker.clear_error())
         self.btn_zero.clicked.connect(lambda: self.worker and self.worker.set_zero())
@@ -219,7 +208,6 @@ class ControlPanel(QGroupBox):
         self.btn_revert.clicked.connect(self._revert)
         self.btn_all0.clicked.connect(lambda: [r.set_value(0.0) for r in self.rows.values()])
         self.sp_rate.valueChanged.connect(self._rates)
-        self.sp_poll.valueChanged.connect(self._rates)
         self._show_applied()
         self.set_bound(None)
 
@@ -227,10 +215,8 @@ class ControlPanel(QGroupBox):
     def set_bound(self, worker):
         self.worker = worker
         on = worker is not None
-        for w in (self.btn_enable, self.btn_disable, self.btn_stream, self.btn_estop, self.btn_clear,
-                  self.btn_zero):
+        for w in (self.btn_enable, self.btn_disable, self.btn_estop, self.btn_clear, self.btn_zero):
             w.setEnabled(on)
-        self._set_stream_btn(False)
         if on:
             self._rates()
             # 连接后将已应用的参数同步给 worker
@@ -240,6 +226,8 @@ class ControlPanel(QGroupBox):
                 lb.setText("—")
             self.lbl_motor.setText("电机状态：—")
             self.lbl_motor.setStyleSheet("")
+            self.lbl_frame.setText("—")
+            self.lbl_rate.setText("—")
 
     def set_limits(self, lim: P.Limits, from_motor: bool):
         self.rows["p"].set_range(lim.p_min, lim.p_max)
@@ -290,15 +278,17 @@ class ControlPanel(QGroupBox):
             txt, style = "电机状态：失能", "background:#e0e0e0"
         else:
             txt, style = f"电机状态：{P.code_text(code)}", "background:#c62828;color:white"
-        if s["enabled"] and not s["streaming"]:
-            txt += "（未周期下发）"
         self.lbl_motor.setText(txt)
         self.lbl_motor.setStyleSheet(style + ";font-weight:bold;border-radius:3px")
-        self._set_stream_btn(s["streaming"])
         self.btn_enable.setEnabled(not s.get("scanning") and s["limits_ok"])
-        self.btn_stream.setEnabled(s["streaming"] or (s["limits_ok"] and not s.get("scanning")))
         self.btn_zero.setEnabled(not s["blocked"])
-        self.lbl_rate.setText(f"{s['tx_rate']:.0f} Hz" if s["streaming"] else "—（未下发）")
+        if s.get("scanning"):
+            self.lbl_frame.setText("扫描中（暂停查询）")
+        elif code == P.CODE_ENABLED:
+            self.lbl_frame.setText("MIT 控制帧")
+        else:
+            self.lbl_frame.setText("0xCC 查询帧")
+        self.lbl_rate.setText(f"{s['tx_rate']:.0f} Hz")
 
     def estop(self):
         if self.worker:
@@ -312,19 +302,6 @@ class ControlPanel(QGroupBox):
         self._show_applied()
 
     # ---------- 内部 ----------
-    def _set_stream_btn(self, on: bool):
-        self._streaming = on
-        self.btn_stream.blockSignals(True)
-        self.btn_stream.setChecked(on)
-        self.btn_stream.blockSignals(False)
-        self.btn_stream.setText("周期下发：开（点击关闭）" if on else "周期下发：关（点击打开）")
-
-    def _stream_clicked(self):
-        want = not self._streaming
-        self._set_stream_btn(self._streaming)      # 以 worker 反馈为准
-        if self.worker:
-            self.worker.set_streaming(want)
-
     def _revert(self):
         for r in self.rows.values():
             r.set_value(r.applied)
@@ -344,5 +321,4 @@ class ControlPanel(QGroupBox):
     def _rates(self):
         if self.worker:
             self.worker.rate_hz = float(self.sp_rate.value())
-            self.worker.poll_hz = float(self.sp_poll.value())
-        self.rate_changed.emit(float(self.sp_rate.value()), float(self.sp_poll.value()))
+        self.rate_changed.emit(float(self.sp_rate.value()))

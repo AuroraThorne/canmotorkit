@@ -103,7 +103,7 @@ class RegisterTab(QWidget):
         en = s["blocked"]
         if en != self.enabled:
             self.enabled = en
-            tip = "使能或周期下发中不可用，请先失能并关闭周期下发" if en else ""
+            tip = "使能中不可用，请先失能" if en else ""
             for b in (self.btn_save, self.btn_change_id):
                 b.setEnabled(self.worker is not None and not en)
                 b.setToolTip(tip)

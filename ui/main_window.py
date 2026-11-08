@@ -167,8 +167,7 @@ class MainWindow(QMainWindow):
         self.regs.on_state(s)
         self.scan.on_state(s)
         pad = "padding:0 8px;"
-        self.st_en.setText(("● 已使能" if s["enabled"] else "○ 未使能") +
-                           (" | 周期下发中" if s["streaming"] else ""))
+        self.st_en.setText("● 已使能" if s["enabled"] else "○ 未使能")
         self.st_en.setStyleSheet(pad + ("color:#2e7d32;font-weight:bold" if s["enabled"] else ""))
         if s["scanning"]:
             self.st_link.setText("扫描中…")
@@ -191,8 +190,8 @@ class MainWindow(QMainWindow):
     def _use_motor(self, motor_id: int, master_id: int):
         if not self.worker:
             return
-        if self.worker.enabled or self.worker.streaming:
-            QMessageBox.information(self, "切换电机", "请先失能并关闭周期下发")
+        if self.worker.enabled:
+            QMessageBox.information(self, "切换电机", "请先失能")
             return
         self.worker.set_ids(motor_id, master_id)
         self.conn.set_ids(motor_id, master_id)

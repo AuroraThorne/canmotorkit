@@ -1,10 +1,11 @@
-"""后台通信线程：接收解析、MIT 周期下发、配置请求串行调度、总线扫描、测试信号。
+"""后台通信线程：接收解析、MIT控制帧或0xCC查询帧定频发送、配置请求串行调度、总线扫描、测试信号。
 
 状态约定（实机验证）：
 - 电机是否使能以状态帧 d0 高 4 位为准：0=失能，1=使能，>=2 故障。
-- “周期下发”是独立开关：打开时按频率发送 MIT 帧；关闭时用 0xCC 轮询状态。
-- 电机使能或周期下发期间不发 0x7FF 配置帧（读请求排队等待，写/保存/扫描拒绝）。
-- p/v/t 量程必须从电机读取（0x15/0x16/0x17）后才允许使能/周期下发。
+- 按统一的通信频率发送：电机已使能时发 MIT 控制帧（已应用的目标），否则发 0xCC 查询帧。
+- 电机使能期间不发 0x7FF 配置帧（读请求排队等待，写/保存/扫描拒绝）。
+- p/v/t 量程必须从电机读取（0x15/0x16/0x17）后才允许使能；若电机已使能但量程未知，
+  只发与量程无关的零扭矩帧（kp=kd=t=0）。
 """
 from __future__ import annotations
 
@@ -29,9 +30,9 @@ LIMIT_RIDS = (0x15, 0x16, 0x17)
 @dataclass
 class Sample:
     t: float
-    cmd: P.MitCommand       # 最近一次下发的 MIT 指令（未周期下发时无意义）
+    cmd: P.MitCommand       # 最近一次下发的 MIT 指令（mit=False 时无意义）
     st: P.Status
-    streaming: bool
+    mit: bool               # 该状态帧显示电机已使能（处于 MIT 发送中）
 
 
 @dataclass
@@ -66,8 +67,7 @@ class Worker(QThread):
         self.limits_ok = False
         self._lim_vals: dict[int, float] = {}
         self.strict_id = False
-        self.rate_hz = 200.0
-        self.poll_hz = 50.0
+        self.rate_hz = 200.0        # 通信频率：MIT 帧或 0xCC 查询帧
         self.req_timeout = 0.1
         self.req_retries = 2
         self.log_enabled = True
@@ -75,7 +75,7 @@ class Worker(QThread):
         self._lock = threading.Lock()
         self._target = P.MitCommand()
         self._last_cmd = P.MitCommand()
-        self._streaming = False
+        self._warned_nolim = False
         self._ops: queue.Queue = queue.Queue()
         self._reqs: collections.deque[_Req] = collections.deque()
         self._pending: _Req | None = None
@@ -97,10 +97,6 @@ class Worker(QThread):
     def enabled(self) -> bool:
         """电机反馈的使能状态。"""
         return self.motor_code == P.CODE_ENABLED
-
-    @property
-    def streaming(self) -> bool:
-        return self._streaming
 
     def set_target(self, cmd: P.MitCommand):
         with self._lock:
@@ -124,9 +120,6 @@ class Worker(QThread):
 
     def estop(self):
         self._post(self._do_estop)
-
-    def set_streaming(self, on: bool):
-        self._post(self._do_set_streaming, bool(on))
 
     def clear_error(self):
         self._post(self._do_clear)
@@ -159,7 +152,7 @@ class Worker(QThread):
         self._post(self._do_stop_signal)
 
     def stop(self):
-        """安全停止：停止周期下发并发失能，再退出线程。"""
+        """安全停止：若已使能先发失能，再退出线程。"""
         self._post(self._do_shutdown)
 
     # ================= 线程内部实现 =================
@@ -183,9 +176,9 @@ class Worker(QThread):
         return True
 
     def _config_blocked(self) -> bool:
-        return self._streaming or self.motor_code == P.CODE_ENABLED
+        return self.motor_code == P.CODE_ENABLED
 
-    BLOCK_TIP = "电机使能或周期下发中，请先失能并关闭周期下发"
+    BLOCK_TIP = "电机使能中，请先失能"
 
     # ---------- 量程 ----------
     def _queue_limit_reads(self):
@@ -196,8 +189,8 @@ class Worker(QThread):
             self._reqs.append(_Req("read", rid, "f", P.read_reg_frame(self.motor_id, rid)))
 
     def _do_reload_limits(self):
-        if self._streaming:
-            self._msg("周期下发中不能重读量程")
+        if self._config_blocked():
+            self._msg("不能重读量程：" + self.BLOCK_TIP)
             return
         self._queue_limit_reads()
         self.limits_changed.emit(self.lim, False)
@@ -237,41 +230,30 @@ class Worker(QThread):
             self._msg("尚未从电机读到 p/v/t 量程，禁止使能（可在参数页重读）")
             return
         if self._send(self.motor_id, P.special_frame(P.SPECIAL_ENABLE)):
-            self._msg("已发送使能 FC" + ("" if self._streaming else "（周期下发未打开，不会发送控制帧）"))
+            self._msg("已发送使能 FC，电机确认使能后改发 MIT 控制帧")
 
-    def _stop_streaming(self):
+    def _abort_signal(self):
         if self._sig:
             self._sig = None
             self.signal_finished.emit()
-        self._streaming = False
+
+    def _went_disabled(self):
+        """发出 FD 后立即切回查询帧，不等应答；以后续状态帧为准。"""
+        if self.motor_code == P.CODE_ENABLED:
+            self.motor_code = P.CODE_DISABLED
 
     def _do_disable(self):
-        self._stop_streaming()
-        self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE))
-        self._msg("已发送失能 FD，周期下发已关闭")
+        self._abort_signal()
+        if self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE)):
+            self._went_disabled()
+        self._msg("已发送失能 FD")
 
     def _do_estop(self):
-        self._stop_streaming()
+        self._abort_signal()
         self._send(self.motor_id, P.pack_mit(P.MitCommand(), self.lim))
-        self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE))
-        self._msg("急停：已发送零力矩帧 + 失能，周期下发已关闭")
-
-    def _do_set_streaming(self, on: bool):
-        if on == self._streaming:
-            return
-        if on:
-            if not self.limits_ok:
-                self._msg("尚未读到量程，不能周期下发")
-                return
-            if self._scan is not None:
-                self._msg("扫描中，不能周期下发")
-                return
-            self._streaming = True
-            self._last_cmd = self._compute_cmd(time.perf_counter())
-            self._msg("周期下发已打开")
-        else:
-            self._stop_streaming()
-            self._msg("周期下发已关闭（电机若仍使能将保持最后指令或触发超时保护）")
+        if self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE)):
+            self._went_disabled()
+        self._msg("急停：已发送零力矩帧 + 失能")
 
     def _do_clear(self):
         self._send(self.motor_id, P.special_frame(P.SPECIAL_CLEAR_ERROR))
@@ -284,7 +266,7 @@ class Worker(QThread):
         self._msg("已发送设零点")
 
     def _do_shutdown(self):
-        if self._streaming or self.motor_code == P.CODE_ENABLED:
+        if self.motor_code == P.CODE_ENABLED:
             self._do_disable()
         self._running = False
 
@@ -330,8 +312,8 @@ class Worker(QThread):
             self._finish_scan()
 
     def _do_start_signal(self, gen: SignalGen, channel: str):
-        if not self._streaming:
-            self._msg("请先打开周期下发再开始测试信号")
+        if self.motor_code != P.CODE_ENABLED or not self.limits_ok:
+            self._msg("请先使能电机（且量程已读取）再开始测试信号")
             self.signal_finished.emit()
             return
         self._sig = (gen, channel, time.perf_counter())
@@ -387,6 +369,9 @@ class Worker(QThread):
             return None
         if st.err != self.motor_code and self.motor_code != -1 and P.is_fault(st.err):
             self._msg(f"电机报告 {P.code_text(st.err)}")
+        if st.err != P.CODE_ENABLED and self._sig:
+            self._abort_signal()
+            self._msg("电机已退出使能，测试信号中止")
         self.motor_code = st.err
         self.last_status = st
         self.last_status_t = f.t
@@ -455,7 +440,7 @@ class Worker(QThread):
                 winmm = None
         self._running = True
         now = time.perf_counter()
-        next_tx = next_poll = next_emit = now
+        next_tx = next_emit = now
         next_bus_check = now + 1.0
         rate_t0, rate_n, tx_rate = now, 0, 0.0
         bus_text = "OK"
@@ -483,25 +468,28 @@ class Worker(QThread):
                         self._frames.append(f)
                     st = self._on_rx(f)
                     if st is not None:
-                        samples.append(Sample(f.t, replace(self._last_cmd), st, self._streaming))
-                # 3) 周期下发 MIT 或状态轮询
+                        samples.append(Sample(f.t, replace(self._last_cmd), st, st.err == P.CODE_ENABLED))
+                # 3) 按通信频率发送：已使能发 MIT 帧，否则发 0xCC 查询帧
                 now = time.perf_counter()
-                if self._streaming:
-                    if now >= next_tx:
-                        cmd = self._compute_cmd(now)
-                        if self._streaming and self._send(self.motor_id, P.pack_mit(cmd, self.lim)):
+                if now >= next_tx:
+                    period = 1.0 / max(1.0, self.rate_hz)
+                    next_tx += period
+                    if next_tx < now:
+                        next_tx = now + period
+                    if self.motor_code == P.CODE_ENABLED:
+                        if self.limits_ok:
+                            cmd = self._compute_cmd(now)
+                        else:
+                            cmd = P.MitCommand()     # 量程未知：只发与量程无关的零扭矩帧
+                            if not self._warned_nolim:
+                                self._warned_nolim = True
+                                self._msg("电机已使能但量程未读取，仅发送零扭矩帧，请先失能")
+                        if self._send(self.motor_id, P.pack_mit(cmd, self.lim)):
                             self._last_cmd = cmd
                             rate_n += 1
-                        period = 1.0 / max(1.0, self.rate_hz)
-                        next_tx += period
-                        if next_tx < now:
-                            next_tx = now + period
-                else:
-                    next_tx = now
-                    if (self.poll_hz > 0 and self._scan is None and self._pending is None
-                            and now >= next_poll):
-                        self._send(P.CONFIG_ID, P.query_state_frame(self.motor_id))
-                        next_poll = now + 1.0 / self.poll_hz
+                    elif self._scan is None and self._pending is None:
+                        if self._send(P.CONFIG_ID, P.query_state_frame(self.motor_id)):
+                            rate_n += 1
                 # 4) 配置 / 扫描
                 self._service_config(now)
                 self._service_scan(now)
@@ -527,10 +515,9 @@ class Worker(QThread):
                     self.state.emit({
                         "code": self.motor_code if link_ok else -1,
                         "enabled": link_ok and self.motor_code == P.CODE_ENABLED,
-                        "streaming": self._streaming,
                         "link_ok": link_ok,
                         "bus": bus_text,
-                        "tx_rate": tx_rate if self._streaming else 0.0,
+                        "tx_rate": tx_rate,
                         "signal": self._sig is not None,
                         "scanning": self._scan is not None,
                         "queue": len(self._reqs) + (1 if self._pending else 0),

@@ -129,8 +129,8 @@ class TestTab(QWidget):
         w = self.worker
         if not w:
             return
-        if not w.streaming or not w.enabled:
-            QMessageBox.information(self, "测试", "请先在控制面板使能电机并打开周期下发")
+        if not w.enabled:
+            QMessageBox.information(self, "测试", "请先在控制面板使能电机")
             return
         ch = self.cb_ch.currentData()
         if ch == "p" and self.sp_kd.value() == 0:
@@ -168,7 +168,7 @@ class TestTab(QWidget):
 
     def on_samples(self, samples):
         if self.recording:
-            self.rec.extend(s for s in samples if s.streaming)
+            self.rec.extend(s for s in samples if s.mit)
 
     def on_finished(self):
         if not self.recording:
