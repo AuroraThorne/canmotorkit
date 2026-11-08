@@ -5,7 +5,6 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
                                QPushButton, QSpinBox, QWidget)
 
-from hm import protocol as P
 from hm.pcan_basic import BAUDRATES, USB_CHANNELS
 
 SIM_LABEL = "仿真总线 (无硬件)"
@@ -38,9 +37,6 @@ class ConnectionPanel(QGroupBox):
         self.sp_master.setRange(0, 0x7FE)
         self.sp_master.setValue(0)
         self.sp_master.setToolTip("电机应答帧 ID（MASTER_ID），出厂默认 0")
-        self.cb_model = QComboBox()
-        self.cb_model.addItems(list(P.MODEL_LIMITS))
-        self.cb_model.setToolTip("量程预设；连接后会读取寄存器 p_max/v_max/t_max 覆盖")
         self.chk_strict = QCheckBox("校验状态帧 ID 低 4 位")
         self.btn_connect = QPushButton("连接")
         self.btn_connect.setMinimumHeight(30)
@@ -50,7 +46,6 @@ class ConnectionPanel(QGroupBox):
         f.addRow("波特率", self.cb_baud)
         f.addRow("电机 ID", self.sp_id)
         f.addRow("Master ID", self.sp_master)
-        f.addRow("型号预设", self.cb_model)
         f.addRow(self.chk_strict)
         f.addRow(self.btn_connect)
 
@@ -89,7 +84,6 @@ class ConnectionPanel(QGroupBox):
             "baud": BAUDRATES[self.cb_baud.currentText()],
             "motor_id": self.sp_id.value(),
             "master_id": self.sp_master.value(),
-            "model": self.cb_model.currentText(),
             "strict": self.chk_strict.isChecked(),
         }
 
@@ -102,8 +96,7 @@ class ConnectionPanel(QGroupBox):
     def set_connected(self, on: bool):
         self._connected = on
         self.btn_connect.setText("断开" if on else "连接")
-        for w in (self.cb_channel, self.btn_refresh, self.cb_baud, self.sp_id, self.sp_master,
-                  self.cb_model):
+        for w in (self.cb_channel, self.btn_refresh, self.cb_baud, self.sp_id, self.sp_master):
             w.setEnabled(not on)
 
     def set_ids(self, motor_id: int, master_id: int):

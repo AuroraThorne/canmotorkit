@@ -62,7 +62,7 @@ class TestTab(QWidget):
         f.addRow("扫频终止频率", self.sp_freq2)
         f.addRow("持续时间", self.sp_dur)
         f.addRow("阶跃延时", self.sp_delay)
-        g2 = QGroupBox("增益（开始时写入控制面板）")
+        g2 = QGroupBox("增益（点“开始”时写入控制面板并应用）")
         f2 = QFormLayout(g2)
         f2.addRow("Kp", self.sp_kp)
         f2.addRow("Kd", self.sp_kd)
@@ -129,8 +129,8 @@ class TestTab(QWidget):
         w = self.worker
         if not w:
             return
-        if not w.enabled:
-            QMessageBox.information(self, "测试", "请先在控制面板使能电机")
+        if not w.streaming or not w.enabled:
+            QMessageBox.information(self, "测试", "请先在控制面板使能电机并打开周期下发")
             return
         ch = self.cb_ch.currentData()
         if ch == "p" and self.sp_kd.value() == 0:
@@ -151,8 +151,9 @@ class TestTab(QWidget):
         if ch == "p":
             cur.p = gen.value(0.0)
         if self.control:
-            self.control.on_target_changed(cur)
-        w.set_target(cur)
+            self.control.set_and_apply(cur)
+        else:
+            w.set_target(cur)
         self.rec = []
         self.recording = True
         w.start_signal(gen, ch)
@@ -167,7 +168,7 @@ class TestTab(QWidget):
 
     def on_samples(self, samples):
         if self.recording:
-            self.rec.extend(s for s in samples if s.enabled)
+            self.rec.extend(s for s in samples if s.streaming)
 
     def on_finished(self):
         if not self.recording:

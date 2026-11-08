@@ -82,8 +82,9 @@ class PcanBus(CanBus):
 class SimMotor:
     """简化的 HM 电机模型：J*a = tau - b*v，按手册协议应答。"""
 
-    def __init__(self, motor_id: int = 1, master_id: int = 0, model: str = "G9"):
-        self.lim = P.MODEL_LIMITS[model]
+    def __init__(self, motor_id: int = 1, master_id: int = 0):
+        # 实测 HM9816G9: p_max=π（单圈位置），v_max=45，t_max=54
+        self.lim = P.DEFAULT_LIMITS.with_maps(p_max=math.pi)
         self.regs: dict[int, float | int] = {
             0x00: 15.0, 0x01: 0.45, 0x02: 100.0, 0x03: 20.0, 0x07: master_id, 0x08: motor_id,
             0x09: 0, 0x0B: 0.02, 0x0C: 0.01, 0x0D: 9816, 0x0E: 106, 0x10: 21, 0x11: 0.121,
@@ -113,7 +114,7 @@ class SimMotor:
         b = float(self.regs[0x0B])
         if self.enabled and self.err == 0:
             c = self.cmd
-            tau = c.kp * (c.p - self.pos) + c.kd * (c.v - self.vel) + c.t
+            tau = c.kp * (c.p - self.out_pos()) + c.kd * (c.v - self.vel) + c.t
             tau = P.clamp(tau, self.lim.t_min, self.lim.t_max)
         else:
             tau = 0.0
@@ -129,9 +130,19 @@ class SimMotor:
         self.regs[0x50] = math.fmod((self.pos - self.offset) * float(self.regs[0x14]), 2 * math.pi)
         self.regs[0x3C] = 24.0 + random.uniform(-0.05, 0.05)
 
+    def out_pos(self) -> float:
+        """输出轴单圈位置 [-π, π)，与实机一致。"""
+        x = self.pos - self.offset
+        return (x + math.pi) % (2 * math.pi) - math.pi
+
+    def code(self) -> int:
+        if self.err:
+            return self.err
+        return P.CODE_ENABLED if self.enabled else P.CODE_DISABLED
+
     def status(self) -> bytes:
         noise = random.gauss(0, 0.0005)
-        return P.pack_status(self.motor_id, self.err, self.pos - self.offset + noise, self.vel,
+        return P.pack_status(self.motor_id, self.code(), self.out_pos() + noise, self.vel,
                              self.tau, int(self.temp), int(self.temp - 2), self.lim)
 
     def handle(self, can_id: int, d: bytes) -> list[tuple[int, bytes]]:
@@ -144,7 +155,7 @@ class SimMotor:
                 code = d[7]
                 if code == P.SPECIAL_ENABLE:
                     self.enabled = True
-                    self.cmd = P.MitCommand(p=self.pos - self.offset)
+                    self.cmd = P.MitCommand()
                 elif code == P.SPECIAL_DISABLE:
                     self.enabled = False
                 elif code == P.SPECIAL_ZERO:
@@ -153,9 +164,7 @@ class SimMotor:
                 elif code == P.SPECIAL_CLEAR_ERROR:
                     self.err = 0
             else:
-                c = P.unpack_mit(d, self.lim)
-                c.p += self.offset
-                self.cmd = c
+                self.cmd = P.unpack_mit(d, self.lim)
             out.append((self.master_id, self.status()))
         elif can_id == P.CONFIG_ID:
             tgt = d[0] | (d[1] << 8)

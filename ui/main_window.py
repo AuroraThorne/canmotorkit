@@ -44,7 +44,6 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
         self.bus = None
         self.worker: Worker | None = None
-        self.lim = P.MODEL_LIMITS["G9"]
 
         self.conn = ConnectionPanel()
         self.control = ControlPanel()
@@ -90,7 +89,6 @@ class MainWindow(QMainWindow):
         self.conn.connect_requested.connect(self.connect_bus)
         self.conn.disconnect_requested.connect(self.disconnect_bus)
         self.conn.strict_changed.connect(lambda on: self.worker and setattr(self.worker, "strict_id", on))
-        self.regs.limits_read.connect(self._on_limits_read)
         self.regs.ids_changed.connect(self.conn.set_ids)
         self.scan.use_motor.connect(self._use_motor)
 
@@ -111,8 +109,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "连接失败", str(e))
             return
         self.bus = bus
-        self.lim = P.MODEL_LIMITS[p["model"]]
-        w = Worker(bus, p["motor_id"], p["master_id"], self.lim)
+        w = Worker(bus, p["motor_id"], p["master_id"])
         w.strict_id = p["strict"]
         w.samples.connect(self._on_samples)
         w.frames.connect(self.scan.on_frames)
@@ -121,16 +118,15 @@ class MainWindow(QMainWindow):
         w.scan_done.connect(self.scan.on_scan_done)
         w.state.connect(self._on_state)
         w.message.connect(self._on_message)
-        w.target_changed.connect(self.control.on_target_changed)
+        w.limits_changed.connect(self.control.set_limits)
         w.signal_finished.connect(self.test.on_finished)
         self.worker = w
-        self.control.set_limits(self.lim)
+        self.control.set_limits(P.DEFAULT_LIMITS, False)
         for panel in (self.control, self.regs, self.test, self.scan):
             panel.set_bound(w)
         self.conn.set_connected(True)
         self.plot.clear()
         w.start()
-        self.regs.read_limits()
         self.st_conn.setText(f"{bus.name} | 电机 ID {w.motor_id} | Master 0x{w.master_id:X}")
         self._on_message(f"已连接 {p['channel_name']}")
 
@@ -171,7 +167,8 @@ class MainWindow(QMainWindow):
         self.regs.on_state(s)
         self.scan.on_state(s)
         pad = "padding:0 8px;"
-        self.st_en.setText("● 已使能" if s["enabled"] else "○ 失能")
+        self.st_en.setText(("● 已使能" if s["enabled"] else "○ 未使能") +
+                           (" | 周期下发中" if s["streaming"] else ""))
         self.st_en.setStyleSheet(pad + ("color:#2e7d32;font-weight:bold" if s["enabled"] else ""))
         if s["scanning"]:
             self.st_link.setText("扫描中…")
@@ -182,32 +179,23 @@ class MainWindow(QMainWindow):
         else:
             self.st_link.setText("⚠ 反馈超时(>200ms)")
             self.st_link.setStyleSheet(pad + "color:white;background:#c62828")
-        self.st_err.setText(f"错误码 {s['err']}" if s["err"] else "无错误")
-        self.st_err.setStyleSheet(pad + ("color:white;background:#c62828" if s["err"] else ""))
+        fault = P.is_fault(s["code"])
+        self.st_err.setText(f"状态码 {s['code']} {P.code_text(s['code'])}" if s["code"] >= 0 else "")
+        self.st_err.setStyleSheet(pad + ("color:white;background:#c62828" if fault else ""))
         self.st_bus.setText(f"总线: {s['bus']}")
 
     def _on_message(self, msg: str):
         self.statusBar().showMessage(msg, 8000)
         self.scan.append_text("# " + msg)
 
-    def _on_limits_read(self, d: dict):
-        self.lim = self.lim.with_maps(**{k: float(v) for k, v in d.items()})
-        if self.worker:
-            self.worker.set_limits(self.lim)
-        self.control.set_limits(self.lim)
-
     def _use_motor(self, motor_id: int, master_id: int):
         if not self.worker:
             return
-        if self.worker.enabled:
-            QMessageBox.information(self, "切换电机", "请先失能")
+        if self.worker.enabled or self.worker.streaming:
+            QMessageBox.information(self, "切换电机", "请先失能并关闭周期下发")
             return
         self.worker.set_ids(motor_id, master_id)
         self.conn.set_ids(motor_id, master_id)
-        self.lim = P.MODEL_LIMITS[self.conn.cb_model.currentText()]
-        self.worker.set_limits(self.lim)
-        self.control.set_limits(self.lim)
-        self.regs.read_limits()
         self.plot.clear()
         self.st_conn.setText(f"{self.bus.name} | 电机 ID {motor_id} | Master 0x{master_id:X}")
         self._on_message(f"已切换到电机 ID {motor_id}")

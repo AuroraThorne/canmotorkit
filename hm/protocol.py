@@ -48,12 +48,9 @@ class Limits:
         return replace(self, **kw)
 
 
-# 手册中 G36 扭矩写作 "-28,-28"，按 ±28 处理
-MODEL_LIMITS: dict[str, Limits] = {
-    "G9": Limits(),
-    "G36": Limits(v_min=-8, v_max=8, t_min=-28, t_max=28),
-    "G10": Limits(v_min=-30, v_max=30, t_min=-10, t_max=10),
-}
+# 兜底量程（手册 G9 默认值）。p/v/t 实际量程以连接后从电机读取的 0x15/0x16/0x17 为准，
+# 未读取成功时禁止使能；KP/KD 量程寄存器表中没有，固定为 0~500 / 0~5。
+DEFAULT_LIMITS = Limits()
 
 
 # ---------------- 定点编解码 ----------------
@@ -137,6 +134,29 @@ class Status:
     t_mos: int          # d6（手册表格称 v_margin，代码称 t_mos，待实机确认）
     t_rotor: int        # d7
     raw: bytes = b""
+
+
+# 状态帧 d0 高 4 位状态码。实测：失能=0，使能=1（与达妙协议一致）；
+# >=8 的故障含义参考达妙定义，未经厂家确认。
+CODE_DISABLED = 0
+CODE_ENABLED = 1
+FAULT_NAMES = {0x8: "过压", 0x9: "欠压", 0xA: "过电流", 0xB: "MOS过温", 0xC: "线圈过温",
+               0xD: "通讯丢失", 0xE: "过载"}
+
+
+def is_fault(code: int) -> bool:
+    return code >= 2
+
+
+def code_text(code: int) -> str:
+    if code < 0:
+        return "未知"
+    if code == CODE_DISABLED:
+        return "失能"
+    if code == CODE_ENABLED:
+        return "已使能"
+    name = FAULT_NAMES.get(code)
+    return f"故障 {code}" + (f"({name}?)" if name else "")
 
 
 def pack_status(motor_id: int, err: int, pos: float, vel: float, torque: float,

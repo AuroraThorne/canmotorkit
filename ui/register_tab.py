@@ -23,7 +23,6 @@ def fmt(typ: str, v) -> str:
 
 
 class RegisterTab(QWidget):
-    limits_read = Signal(object)        # dict name->value，用于更新量程
     ids_changed = Signal(int, int)      # 新 motor_id, master_id
 
     def __init__(self, parent=None):
@@ -60,13 +59,15 @@ class RegisterTab(QWidget):
         self.btn_save.setStyleSheet("QPushButton{font-weight:bold}")
         self.btn_save.setToolTip("保存参数只在失能模式下生效")
         self.btn_change_id = QPushButton("修改 ID…")
+        self.btn_limits = QPushButton("重读量程")
+        self.btn_limits.setToolTip("重新读取 p_max/v_max/t_max 并更新 MIT 编解码量程")
         self.btn_export = QPushButton("导出 JSON")
         self.btn_import = QPushButton("导入 JSON")
         self.lbl = QLabel()
         self.lbl.setStyleSheet("color:gray")
         bar = QHBoxLayout()
         for b in (self.btn_read_all, self.btn_read_sel, self.btn_write, self.btn_save,
-                  self.btn_change_id, self.btn_export, self.btn_import):
+                  self.btn_change_id, self.btn_limits, self.btn_export, self.btn_import):
             bar.addWidget(b)
         bar.addStretch(1)
 
@@ -84,6 +85,7 @@ class RegisterTab(QWidget):
         self.btn_write.clicked.connect(self._write_modified)
         self.btn_save.clicked.connect(self._save)
         self.btn_change_id.clicked.connect(self._change_id)
+        self.btn_limits.clicked.connect(self.read_limits)
         self.btn_export.clicked.connect(self._export)
         self.btn_import.clicked.connect(self._import)
         self.table.itemChanged.connect(self._on_item_changed)
@@ -93,14 +95,15 @@ class RegisterTab(QWidget):
     def set_bound(self, worker):
         self.worker = worker
         for b in (self.btn_read_all, self.btn_read_sel, self.btn_write, self.btn_save,
-                  self.btn_change_id):
+                  self.btn_change_id, self.btn_limits):
             b.setEnabled(worker is not None)
+        self.enabled = False
 
     def on_state(self, s: dict):
-        en = s["enabled"]
+        en = s["blocked"]
         if en != self.enabled:
             self.enabled = en
-            tip = "使能中不可用，请先失能" if en else ""
+            tip = "使能或周期下发中不可用，请先失能并关闭周期下发" if en else ""
             for b in (self.btn_save, self.btn_change_id):
                 b.setEnabled(self.worker is not None and not en)
                 b.setToolTip(tip)
@@ -116,8 +119,7 @@ class RegisterTab(QWidget):
 
     def read_limits(self):
         if self.worker:
-            for rid in (0x15, 0x16, 0x17):
-                self.worker.read_reg(rid)
+            self.worker.reload_limits()
 
     def on_reg_done(self, kind: str, rid: int, value, err: str):
         if kind == "save":
@@ -153,8 +155,6 @@ class RegisterTab(QWidget):
             it.setBackground(QBrush())
         self.table.blockSignals(False)
         self.lbl.setText(f"✔ {kind} 0x{rid:02X} {reg.name} = {fmt(reg.typ, value)}")
-        if rid in (0x15, 0x16, 0x17) and kind == "read":
-            self.limits_read.emit({reg.name: value})
 
     # ---------- 内部 ----------
     def _on_item_changed(self, it: QTableWidgetItem):

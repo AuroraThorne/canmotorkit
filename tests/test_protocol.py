@@ -5,7 +5,7 @@ import pytest
 
 from hm import protocol as P
 
-G9 = P.MODEL_LIMITS["G9"]
+G9 = P.DEFAULT_LIMITS
 
 
 @pytest.mark.parametrize("x,lo,hi,bits", [
@@ -86,6 +86,12 @@ def test_value_types():
 def test_limits_override():
     lim = G9.with_maps(p_max=25.0, v_max=None, t_max=40.0)
     assert (lim.p_min, lim.p_max, lim.v_max, lim.t_min) == (-25.0, 25.0, 45.0, -40.0)
+
+
+def test_status_code_text():
+    assert P.code_text(0) == "失能" and P.code_text(1) == "已使能"
+    assert not P.is_fault(1) and P.is_fault(8)
+    assert "过压" in P.code_text(8)
 
 
 def test_register_table_unique():

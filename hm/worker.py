@@ -1,11 +1,16 @@
-"""后台通信线程：接收解析、MIT 周期发送、配置请求串行调度、总线扫描、测试信号。
+"""后台通信线程：接收解析、MIT 周期下发、配置请求串行调度、总线扫描、测试信号。
 
-UI 只通过公开方法（线程安全，内部投递到线程队列）与 Qt 信号和本线程交互。
+状态约定（实机验证）：
+- 电机是否使能以状态帧 d0 高 4 位为准：0=失能，1=使能，>=2 故障。
+- “周期下发”是独立开关：打开时按频率发送 MIT 帧；关闭时用 0xCC 轮询状态。
+- 电机使能或周期下发期间不发 0x7FF 配置帧（读请求排队等待，写/保存/扫描拒绝）。
+- p/v/t 量程必须从电机读取（0x15/0x16/0x17）后才允许使能/周期下发。
 """
 from __future__ import annotations
 
 import collections
 import ctypes
+import math
 import queue
 import sys
 import threading
@@ -18,13 +23,15 @@ from . import protocol as P
 from .bus import BusError, CanBus, Frame
 from .siggen import SignalGen
 
+LIMIT_RIDS = (0x15, 0x16, 0x17)
+
 
 @dataclass
 class Sample:
     t: float
-    cmd: P.MitCommand       # 最近一次下发的指令（失能时为全 0）
+    cmd: P.MitCommand       # 最近一次下发的 MIT 指令（未周期下发时无意义）
     st: P.Status
-    enabled: bool
+    streaming: bool
 
 
 @dataclass
@@ -45,18 +52,19 @@ class Worker(QThread):
     scan_done = Signal(object)          # list[(motor_id, reply_can_id, Status)]
     state = Signal(object)              # dict
     message = Signal(str)
-    target_changed = Signal(object)     # MitCommand
+    limits_changed = Signal(object, bool)   # Limits, 是否已从电机读取
     signal_finished = Signal()
 
     EMIT_HZ = 30
 
-    def __init__(self, bus: CanBus, motor_id: int = 1, master_id: int = 0,
-                 lim: P.Limits | None = None):
+    def __init__(self, bus: CanBus, motor_id: int = 1, master_id: int = 0):
         super().__init__()
         self.bus = bus
         self.motor_id = motor_id
         self.master_id = master_id
-        self.lim = lim or P.MODEL_LIMITS["G9"]
+        self.lim = P.DEFAULT_LIMITS
+        self.limits_ok = False
+        self._lim_vals: dict[int, float] = {}
         self.strict_id = False
         self.rate_hz = 200.0
         self.poll_hz = 50.0
@@ -67,7 +75,7 @@ class Worker(QThread):
         self._lock = threading.Lock()
         self._target = P.MitCommand()
         self._last_cmd = P.MitCommand()
-        self._enabled = False
+        self._streaming = False
         self._ops: queue.Queue = queue.Queue()
         self._reqs: collections.deque[_Req] = collections.deque()
         self._pending: _Req | None = None
@@ -76,9 +84,10 @@ class Worker(QThread):
         self._running = False
         self._frames: list[Frame] = []
         self._last_err_t = 0.0
-        self._tx_count = 0
+        self.motor_code = -1                # 最近状态帧状态码，-1 = 未知
         self.last_status: P.Status | None = None
         self.last_status_t = 0.0
+        self._queue_limit_reads()
 
     # ================= 线程安全的公开接口 =================
     def _post(self, fn, *a):
@@ -86,7 +95,12 @@ class Worker(QThread):
 
     @property
     def enabled(self) -> bool:
-        return self._enabled
+        """电机反馈的使能状态。"""
+        return self.motor_code == P.CODE_ENABLED
+
+    @property
+    def streaming(self) -> bool:
+        return self._streaming
 
     def set_target(self, cmd: P.MitCommand):
         with self._lock:
@@ -99,8 +113,8 @@ class Worker(QThread):
     def set_ids(self, motor_id: int, master_id: int):
         self._post(self._do_set_ids, motor_id, master_id)
 
-    def set_limits(self, lim: P.Limits):
-        self._post(setattr, self, "lim", lim)
+    def reload_limits(self):
+        self._post(self._do_reload_limits)
 
     def enable(self):
         self._post(self._do_enable)
@@ -111,16 +125,17 @@ class Worker(QThread):
     def estop(self):
         self._post(self._do_estop)
 
+    def set_streaming(self, on: bool):
+        self._post(self._do_set_streaming, bool(on))
+
     def clear_error(self):
-        self._post(self._send, self.motor_id_ref, P.special_frame(P.SPECIAL_CLEAR_ERROR))
+        self._post(self._do_clear)
 
     def set_zero(self):
         self._post(self._do_zero)
 
     def read_reg(self, rid: int):
-        reg = P.REG_BY_RID.get(rid)
-        self._post(self._enqueue, _Req("read", rid, reg.typ if reg else "u",
-                                       P.read_reg_frame(self.motor_id, rid)))
+        self._post(self._do_read, rid)
 
     def write_reg(self, rid: int, value):
         self._post(self._do_write, rid, value)
@@ -144,13 +159,8 @@ class Worker(QThread):
         self._post(self._do_stop_signal)
 
     def stop(self):
-        """安全停止：若已使能先发失能，再退出线程。"""
+        """安全停止：停止周期下发并发失能，再退出线程。"""
         self._post(self._do_shutdown)
-
-    # 给 clear_error 在线程内取最新 ID 用
-    @property
-    def motor_id_ref(self) -> int:
-        return self.motor_id
 
     # ================= 线程内部实现 =================
     def _msg(self, s: str):
@@ -172,54 +182,118 @@ class Worker(QThread):
             self._frames.append(Frame(time.perf_counter(), can_id, bytes(data), True))
         return True
 
+    def _config_blocked(self) -> bool:
+        return self._streaming or self.motor_code == P.CODE_ENABLED
+
+    BLOCK_TIP = "电机使能或周期下发中，请先失能并关闭周期下发"
+
+    # ---------- 量程 ----------
+    def _queue_limit_reads(self):
+        self.limits_ok = False
+        self._lim_vals = {}
+        self._reqs = collections.deque(r for r in self._reqs if r.rid not in LIMIT_RIDS)
+        for rid in LIMIT_RIDS:
+            self._reqs.append(_Req("read", rid, "f", P.read_reg_frame(self.motor_id, rid)))
+
+    def _do_reload_limits(self):
+        if self._streaming:
+            self._msg("周期下发中不能重读量程")
+            return
+        self._queue_limit_reads()
+        self.limits_changed.emit(self.lim, False)
+
+    def _on_limit_value(self, rid: int, val):
+        v = float(val)
+        if not math.isfinite(v) or v <= 0:
+            self._msg(f"量程寄存器 0x{rid:02X} 值无效: {v}")
+            return
+        self._lim_vals[rid] = v
+        if all(r in self._lim_vals for r in LIMIT_RIDS):
+            self.lim = P.DEFAULT_LIMITS.with_maps(self._lim_vals[0x15], self._lim_vals[0x16],
+                                                  self._lim_vals[0x17])
+            was = self.limits_ok
+            self.limits_ok = True
+            self.limits_changed.emit(self.lim, True)
+            if not was:
+                L = self.lim
+                self._msg(f"已读取量程: p±{L.p_max:.4g} v±{L.v_max:.4g} t±{L.t_max:.4g}")
+
+    # ---------- 模式 ----------
     def _do_set_ids(self, motor_id: int, master_id: int):
-        if self._enabled:
-            self._msg("使能中不能修改 ID，请先失能")
+        if self._config_blocked():
+            self._msg("不能切换 ID：" + self.BLOCK_TIP)
             return
         self.motor_id, self.master_id = motor_id, master_id
         self.last_status = None
+        self.motor_code = -1
+        self._queue_limit_reads()
+        self.limits_changed.emit(self.lim, False)
 
     def _do_enable(self):
         if self._scan is not None:
             self._msg("扫描中，不能使能")
             return
-        p0 = self.last_status.pos if self.last_status else 0.0
-        tgt = P.MitCommand(p=p0, v=0.0, kp=0.0, kd=0.5, t=0.0)
-        self.set_target(tgt)
-        self.target_changed.emit(replace(tgt))
+        if not self.limits_ok:
+            self._msg("尚未从电机读到 p/v/t 量程，禁止使能（可在参数页重读）")
+            return
         if self._send(self.motor_id, P.special_frame(P.SPECIAL_ENABLE)):
-            self._enabled = True
-            self._last_cmd = replace(tgt)   # 避免首个样本记录为全 0 指令
-            self._msg(f"已发送使能 (ID={self.motor_id})，初始目标 p={p0:.3f} kp=0 kd=0.5")
+            self._msg("已发送使能 FC" + ("" if self._streaming else "（周期下发未打开，不会发送控制帧）"))
+
+    def _stop_streaming(self):
+        if self._sig:
+            self._sig = None
+            self.signal_finished.emit()
+        self._streaming = False
 
     def _do_disable(self):
-        self._sig = None
-        self._enabled = False
+        self._stop_streaming()
         self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE))
-        self._msg("已发送失能")
+        self._msg("已发送失能 FD，周期下发已关闭")
 
     def _do_estop(self):
-        self._sig = None
-        self._enabled = False
-        p = self.last_status.pos if self.last_status else 0.0
-        self._send(self.motor_id, P.pack_mit(P.MitCommand(p=p), self.lim))
+        self._stop_streaming()
+        self._send(self.motor_id, P.pack_mit(P.MitCommand(), self.lim))
         self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE))
-        self._msg("急停：已发送零力矩帧 + 失能")
+        self._msg("急停：已发送零力矩帧 + 失能，周期下发已关闭")
+
+    def _do_set_streaming(self, on: bool):
+        if on == self._streaming:
+            return
+        if on:
+            if not self.limits_ok:
+                self._msg("尚未读到量程，不能周期下发")
+                return
+            if self._scan is not None:
+                self._msg("扫描中，不能周期下发")
+                return
+            self._streaming = True
+            self._last_cmd = self._compute_cmd(time.perf_counter())
+            self._msg("周期下发已打开")
+        else:
+            self._stop_streaming()
+            self._msg("周期下发已关闭（电机若仍使能将保持最后指令或触发超时保护）")
+
+    def _do_clear(self):
+        self._send(self.motor_id, P.special_frame(P.SPECIAL_CLEAR_ERROR))
 
     def _do_zero(self):
-        if self._enabled:
-            self._msg("请先失能再设置零点")
+        if self._config_blocked():
+            self._msg("不能设零点：" + self.BLOCK_TIP)
             return
         self._send(self.motor_id, P.special_frame(P.SPECIAL_ZERO))
         self._msg("已发送设零点")
 
     def _do_shutdown(self):
-        if self._enabled:
+        if self._streaming or self.motor_code == P.CODE_ENABLED:
             self._do_disable()
         self._running = False
 
-    def _enqueue(self, req: _Req):
-        self._reqs.append(req)
+    # ---------- 配置 ----------
+    def _do_read(self, rid: int):
+        reg = P.REG_BY_RID.get(rid)
+        if any(r.kind == "read" and r.rid == rid for r in self._reqs):
+            return
+        self._reqs.append(_Req("read", rid, reg.typ if reg else "u", P.read_reg_frame(self.motor_id, rid)))
 
     def _do_write(self, rid: int, value):
         reg = P.REG_BY_RID.get(rid)
@@ -227,25 +301,25 @@ class Worker(QThread):
         if reg and reg.ro:
             self.reg_done.emit("write", rid, None, "只读寄存器")
             return
-        if self._enabled and rid in (0x07, 0x08):
-            self.reg_done.emit("write", rid, None, "使能中不能修改 ID，请先失能")
+        if self._config_blocked():
+            self.reg_done.emit("write", rid, None, self.BLOCK_TIP)
             return
         try:
             frame = P.write_reg_frame(self.motor_id, rid, typ, value)
-        except (ValueError, OverflowError, Exception) as e:  # struct.error
+        except Exception as e:  # struct.error / ValueError
             self.reg_done.emit("write", rid, None, f"数值无效: {e}")
             return
         self._reqs.append(_Req("write", rid, typ, frame))
 
     def _do_save(self):
-        if self._enabled:
-            self.reg_done.emit("save", 0, None, "保存参数只在失能模式下生效，请先失能")
+        if self._config_blocked():
+            self.reg_done.emit("save", 0, None, "保存参数只在失能模式下生效：" + self.BLOCK_TIP)
             return
         self._reqs.append(_Req("save", 0, "u", P.save_frame(self.motor_id)))
 
     def _do_scan(self, ids: list[int], window: float):
-        if self._enabled:
-            self._msg("请先失能再扫描")
+        if self._config_blocked():
+            self._msg("不能扫描：" + self.BLOCK_TIP)
             self.scan_done.emit([])
             return
         self._scan = {"ids": ids, "i": -1, "cur": None, "deadline": 0.0,
@@ -256,8 +330,8 @@ class Worker(QThread):
             self._finish_scan()
 
     def _do_start_signal(self, gen: SignalGen, channel: str):
-        if not self._enabled:
-            self._msg("请先使能再开始测试信号")
+        if not self._streaming:
+            self._msg("请先打开周期下发再开始测试信号")
             self.signal_finished.emit()
             return
         self._sig = (gen, channel, time.perf_counter())
@@ -272,7 +346,6 @@ class Worker(QThread):
         setattr(tgt, ch, hold)
         self.set_target(tgt)
         self._sig = None
-        self.target_changed.emit(replace(tgt))
         self.signal_finished.emit()
 
     # ---------- 周期任务 ----------
@@ -312,6 +385,9 @@ class Worker(QThread):
         st = P.unpack_status(d, self.lim)
         if self.strict_id and st.motor_id4 != (mid & 0x0F):
             return None
+        if st.err != self.motor_code and self.motor_code != -1 and P.is_fault(st.err):
+            self._msg(f"电机报告 {P.code_text(st.err)}")
+        self.motor_code = st.err
         self.last_status = st
         self.last_status_t = f.t
         return st
@@ -321,6 +397,8 @@ class Worker(QThread):
         self._pending = None
         r = P.parse_config_reply(d)
         val = True if p.kind == "save" else P.decode_value(p.typ, r.raw4)
+        if p.kind == "read" and p.rid in LIMIT_RIDS:
+            self._on_limit_value(p.rid, val)
         self.reg_done.emit(p.kind, p.rid, val, "")
 
     def _service_config(self, now: float):
@@ -333,9 +411,11 @@ class Worker(QThread):
                     self._send(P.CONFIG_ID, p.frame)
                 else:
                     self._pending = None
+                    if p.kind == "read" and p.rid in LIMIT_RIDS:
+                        self._msg(f"量程寄存器 0x{p.rid:02X} 读取超时，禁止使能（可在参数页重读）")
                     self.reg_done.emit(p.kind, p.rid, None, "超时无应答")
             return
-        if self._reqs and self._scan is None:
+        if self._reqs and self._scan is None and not self._config_blocked():
             p = self._reqs.popleft()
             p.tries = 1
             p.deadline = now + self.req_timeout
@@ -403,13 +483,13 @@ class Worker(QThread):
                         self._frames.append(f)
                     st = self._on_rx(f)
                     if st is not None:
-                        samples.append(Sample(f.t, replace(self._last_cmd), st, self._enabled))
-                # 3) 发送 MIT 或状态轮询
+                        samples.append(Sample(f.t, replace(self._last_cmd), st, self._streaming))
+                # 3) 周期下发 MIT 或状态轮询
                 now = time.perf_counter()
-                if self._enabled:
+                if self._streaming:
                     if now >= next_tx:
                         cmd = self._compute_cmd(now)
-                        if self._enabled and self._send(self.motor_id, P.pack_mit(cmd, self.lim)):
+                        if self._streaming and self._send(self.motor_id, P.pack_mit(cmd, self.lim)):
                             self._last_cmd = cmd
                             rate_n += 1
                         period = 1.0 / max(1.0, self.rate_hz)
@@ -417,7 +497,6 @@ class Worker(QThread):
                         if next_tx < now:
                             next_tx = now + period
                 else:
-                    self._last_cmd = P.MitCommand()
                     next_tx = now
                     if (self.poll_hz > 0 and self._scan is None and self._pending is None
                             and now >= next_poll):
@@ -444,16 +523,19 @@ class Worker(QThread):
                         fr, self._frames = self._frames, []
                         fr.sort(key=lambda x: x.t)
                         self.frames.emit(fr)
-                    st = self.last_status
+                    link_ok = self.last_status is not None and (now - self.last_status_t) < 0.2
                     self.state.emit({
-                        "enabled": self._enabled,
-                        "link_ok": st is not None and (now - self.last_status_t) < 0.2,
-                        "err": st.err if st else 0,
+                        "code": self.motor_code if link_ok else -1,
+                        "enabled": link_ok and self.motor_code == P.CODE_ENABLED,
+                        "streaming": self._streaming,
+                        "link_ok": link_ok,
                         "bus": bus_text,
-                        "tx_rate": tx_rate if self._enabled else 0.0,
+                        "tx_rate": tx_rate if self._streaming else 0.0,
                         "signal": self._sig is not None,
                         "scanning": self._scan is not None,
                         "queue": len(self._reqs) + (1 if self._pending else 0),
+                        "limits_ok": self.limits_ok,
+                        "blocked": self._config_blocked(),
                     })
                 time.sleep(0.0005)
         finally:
