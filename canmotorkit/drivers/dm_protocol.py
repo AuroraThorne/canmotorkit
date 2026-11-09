@@ -140,7 +140,7 @@ class Status:
 # >=8 的故障含义参考达妙定义，未经厂家确认。
 CODE_DISABLED = 0
 CODE_ENABLED = 1
-FAULT_NAMES = {0x8: "过压", 0x9: "欠压", 0xA: "过电流", 0xB: "MOS过温", 0xC: "线圈过温",
+FAULT_NAMES = {0x3: "输出轴校准异常", 0x4: "传感器异常", 0x5: "编码器校准异常", 0x8: "过压", 0x9: "欠压", 0xA: "过电流", 0xB: "MOS过温", 0xC: "线圈过温",
                0xD: "通讯丢失", 0xE: "过载"}
 
 
@@ -196,39 +196,70 @@ class Register:
     desc: str
     ro: bool = False
     unit: str = ""
+    src: str = "both"   # both=两家都有 / dm=仅达妙 / hm=仅 HM
+    alt: str = ""       # 达妙文档中的名称
 
 
+SRC_TEXT = {"both": "两家都有", "dm": "仅达妙", "hm": "仅 HM"}
+
+
+def _R(rid, name, typ, desc, ro=False, unit="", src="both", alt=""):
+    return Register(rid, name, typ, desc, ro, unit, src, alt)
+
+
+# HM 手册 V1.06 寄存器表 ∪ 达妙寄存器。达妙部分依据达妙 SDK（说明书原表为图片），待核对。
+# 可能改变控制模式 / 通信 / 标定结果的寄存器在本软件中设为只读。
 REGISTERS: list[Register] = [
-    Register(0x00, "uv_value", "f", "低压保护值", unit="V"),
-    Register(0x01, "kt", "f", "扭矩系数", unit="Nm/A"),
-    Register(0x02, "temp_max", "f", "过温保护值", unit="℃"),
-    Register(0x03, "i_fw_max", "f", "持续电流保护", unit="A"),
-    Register(0x07, "can_master", "u", "反馈ID (MASTER_ID)"),
-    Register(0x08, "can_id", "u", "接收ID (电机ID)"),
-    Register(0x09, "can_timeout", "u", "超时警报时间(0为关闭)"),
-    Register(0x0B, "damp", "f", "电机粘滞系数"),
-    Register(0x0C, "inertia", "f", "电机转动惯量"),
-    Register(0x0D, "motor_type", "i", "电机型号"),
-    Register(0x0E, "config_version", "i", "软件版本号"),
-    Register(0x10, "ppairs", "i", "电机极对数"),
-    Register(0x11, "r_nominal", "f", "电机相电阻", unit="Ω"),
-    Register(0x12, "ls", "f", "电机相电感", unit="H"),
-    Register(0x13, "flux", "f", "电机磁链值", unit="Wb"),
-    Register(0x14, "gr", "f", "齿轮减速比"),
-    Register(0x15, "p_max", "f", "位置映射范围", unit="rad"),
-    Register(0x16, "v_max", "f", "速度映射范围", unit="rad/s"),
-    Register(0x17, "t_max", "f", "扭矩映射范围", unit="Nm"),
-    Register(0x18, "i_bw", "f", "电流环控制带宽", unit="Hz"),
-    Register(0x1D, "ov_value", "f", "过压保护值", unit="V"),
-    Register(0x23, "can_baudrate", "i", "波特率索引(仅CAN FD版可改)", ro=True),
-    Register(0x32, "adc_a_offset", "f", "A相零电流偏移"),
-    Register(0x33, "adc_b_offset", "f", "B相零电流偏移"),
-    Register(0x3B, "i_max", "f", "驱动板最大电流", unit="A"),
-    Register(0x3C, "v_bus", "f", "电源电压", ro=True, unit="V"),
-    Register(0x3D, "t_mos", "f", "驱动板温度", ro=True, unit="℃"),
-    Register(0x3E, "t_rotor", "f", "电机温度", ro=True, unit="℃"),
-    Register(0x50, "angle_singleturn", "f", "电机轴当前位置", ro=True, unit="rad"),
-    Register(0x51, "output_angle_multiturn", "f", "输出轴位置", ro=True, unit="rad"),
+    _R(0x00, "uv_value", "f", "欠压保护值", unit="V", alt="UV_Value"),
+    _R(0x01, "kt", "f", "扭矩系数", alt="KT_Value"),
+    _R(0x02, "temp_max", "f", "过温保护值", unit="℃", alt="OT_Value"),
+    _R(0x03, "i_fw_max", "f", "过流/持续电流保护（达妙为百分比）", alt="OC_Value"),
+    _R(0x04, "acc", "f", "加速度（非 MIT 模式）", unit="krad/s²", src="dm", alt="ACC"),
+    _R(0x05, "dec", "f", "减速度（非 MIT 模式）", unit="krad/s²", src="dm", alt="DEC"),
+    _R(0x06, "max_spd", "f", "转子限速", unit="rad/s", src="dm", alt="MAX_SPD"),
+    _R(0x07, "can_master", "u", "反馈 ID (Master ID)", alt="MST_ID"),
+    _R(0x08, "can_id", "u", "接收 ID (电机 ID)", alt="ESC_ID"),
+    _R(0x09, "can_timeout", "u", "通信超时（0 关闭；达妙单位 50 µs，仅使能时生效）", alt="TIMEOUT"),
+    _R(0x0A, "ctrl_mode", "u", "控制模式 1 MIT/2 位置速度/3 速度/4 力位（本软件只读）", ro=True,
+       src="dm", alt="CTRL_MODE"),
+    _R(0x0B, "damp", "f", "电机粘滞系数", alt="Damp"),
+    _R(0x0C, "inertia", "f", "电机转动惯量", alt="Inertia"),
+    _R(0x0D, "motor_type", "i", "HM 电机型号 / 达妙硬件版本", ro=True, alt="hw_ver"),
+    _R(0x0E, "config_version", "i", "HM 软件版本 / 达妙软件版本", ro=True, alt="sw_ver"),
+    _R(0x0F, "sn", "u", "序列号", ro=True, src="dm", alt="SN"),
+    _R(0x10, "ppairs", "i", "电机极对数（标定值）", ro=True, alt="NPP"),
+    _R(0x11, "r_nominal", "f", "相电阻（标定值）", ro=True, unit="Ω", alt="Rs"),
+    _R(0x12, "ls", "f", "相电感（标定值）", ro=True, unit="H", alt="LS"),
+    _R(0x13, "flux", "f", "磁链（标定值）", ro=True, unit="Wb", alt="Flux"),
+    _R(0x14, "gr", "f", "减速比（切勿修改）", ro=True, alt="Gr"),
+    _R(0x15, "p_max", "f", "位置映射范围", unit="rad", alt="PMAX"),
+    _R(0x16, "v_max", "f", "速度映射范围", unit="rad/s", alt="VMAX"),
+    _R(0x17, "t_max", "f", "扭矩映射范围", unit="Nm", alt="TMAX"),
+    _R(0x18, "i_bw", "f", "电流环带宽", unit="Hz", alt="I_BW"),
+    _R(0x19, "kp_asr", "f", "速度环 Kp（非 MIT 模式）", src="dm", alt="KP_ASR"),
+    _R(0x1A, "ki_asr", "f", "速度环 Ki", src="dm", alt="KI_ASR"),
+    _R(0x1B, "kp_apr", "f", "位置环 Kp", src="dm", alt="KP_APR"),
+    _R(0x1C, "ki_apr", "f", "位置环 Ki", src="dm", alt="KI_APR"),
+    _R(0x1D, "ov_value", "f", "过压保护值", unit="V", alt="OV_Value"),
+    _R(0x1E, "gref", "f", "齿轮力矩效率", src="dm", alt="GREF"),
+    _R(0x1F, "deta", "f", "速度环阻尼系数", src="dm", alt="Deta"),
+    _R(0x20, "v_bw", "f", "速度环滤波带宽", src="dm", alt="V_BW"),
+    _R(0x21, "iq_c1", "f", "电流环增强系数", src="dm", alt="IQ_c1"),
+    _R(0x22, "vl_c1", "f", "速度环增强系数", src="dm", alt="VL_c1"),
+    _R(0x23, "can_baudrate", "i", "波特率索引（本软件只读）", ro=True, alt="can_br"),
+    _R(0x24, "sub_ver", "u", "子版本号", ro=True, src="dm", alt="sub_ver"),
+    _R(0x32, "adc_a_offset", "f", "A/U 相零电流偏移（标定值）", ro=True, alt="u_off"),
+    _R(0x33, "adc_b_offset", "f", "B/V 相零电流偏移（标定值）", ro=True, alt="v_off"),
+    _R(0x34, "k1", "f", "补偿因子 1", ro=True, src="dm", alt="k1"),
+    _R(0x35, "k2", "f", "补偿因子 2", ro=True, src="dm", alt="k2"),
+    _R(0x36, "m_off", "f", "角度偏移", ro=True, src="dm", alt="m_off"),
+    _R(0x37, "dir", "f", "方向", ro=True, src="dm", alt="dir"),
+    _R(0x3B, "i_max", "f", "驱动板最大电流", unit="A", src="hm"),
+    _R(0x3C, "v_bus", "f", "电源电压", ro=True, unit="V", src="hm"),
+    _R(0x3D, "t_mos", "f", "驱动板温度", ro=True, unit="℃", src="hm"),
+    _R(0x3E, "t_rotor", "f", "电机温度", ro=True, unit="℃", src="hm"),
+    _R(0x50, "angle_singleturn", "f", "电机轴位置", ro=True, unit="rad", alt="p_m"),
+    _R(0x51, "output_angle_multiturn", "f", "输出轴位置", ro=True, unit="rad", alt="xout"),
 ]
 REG_BY_RID = {r.rid: r for r in REGISTERS}
 REG_BY_NAME = {r.name: r for r in REGISTERS}
