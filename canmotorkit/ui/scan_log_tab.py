@@ -1,62 +1,32 @@
-"""总线扫描 + 原始报文日志 + 手动发送。"""
+"""报文页：原始帧日志（解析注释/过滤/保存）、手动发送、往返延迟直方图。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView,
-                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout,
+                               QWidget)
 
 from canmotorkit.drivers import dm_protocol as P
 
 
 class ScanLogTab(QWidget):
-    use_motor = Signal(int, int)        # motor_id, master_id
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
+        self.driver = None
         self.t0: float | None = None
-        self._lines: list[str] = []
 
-        # ---- 扫描 ----
-        sg = QGroupBox("总线扫描（0x7FF / 0xCC 查询）")
-        self.sp_from = QSpinBox()
-        self.sp_from.setRange(1, 127)
-        self.sp_to = QSpinBox()
-        self.sp_to.setRange(1, 127)
-        self.sp_to.setValue(127)
-        self.sp_win = QSpinBox()
-        self.sp_win.setRange(5, 200)
-        self.sp_win.setValue(20)
-        self.sp_win.setSuffix(" ms")
-        self.btn_scan = QPushButton("开始扫描")
-        self.prog = QProgressBar()
-        self.tbl = QTableWidget(0, 6)
-        self.tbl.setHorizontalHeaderLabels(["电机 ID", "应答帧 ID (Master)", "位置", "错误码", "温度", ""])
-        self.tbl.verticalHeader().setVisible(False)
-        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        row = QHBoxLayout()
-        for w in (QLabel("ID 从"), self.sp_from, QLabel("到"), self.sp_to, QLabel("每个等待"),
-                  self.sp_win, self.btn_scan):
-            row.addWidget(w)
-        row.addWidget(self.prog, 1)
-        sl = QVBoxLayout(sg)
-        sl.addLayout(row)
-        sl.addWidget(self.tbl)
-        note = QLabel("扫描时需失能；状态帧中 ID 仅低 4 位，结果按“请求 ID → 等待窗口内应答”关联。")
-        note.setStyleSheet("color:gray")
-        sl.addWidget(note)
-
-        # ---- 日志 ----
         lg = QGroupBox("报文日志")
         self.chk_log = QCheckBox("记录")
         self.chk_log.setChecked(True)
         self.chk_pause = QCheckBox("暂停显示")
-        self.chk_hide_mit = QCheckBox("隐藏 MIT 周期帧/状态帧")
+        self.chk_hide = QCheckBox("隐藏周期帧（控制/反馈/查询）")
+        self.chk_mine = QCheckBox("只显示当前电机")
         self.ed_filter = QLineEdit()
-        self.ed_filter.setPlaceholderText("过滤 ID（十六进制，逗号分隔，如 7FF,0）")
+        self.ed_filter.setPlaceholderText("过滤 ID（十六进制，逗号分隔，如 7FF,0,201）")
         self.btn_clear = QPushButton("清空")
         self.btn_save = QPushButton("保存…")
         self.log = QPlainTextEdit()
@@ -65,21 +35,18 @@ class ScanLogTab(QWidget):
         self.log.setFont(QFont("Consolas", 9))
         self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
         lr = QHBoxLayout()
-        for w in (self.chk_log, self.chk_pause, self.chk_hide_mit):
+        for w in (self.chk_log, self.chk_pause, self.chk_hide, self.chk_mine):
             lr.addWidget(w)
         lr.addWidget(self.ed_filter, 1)
         lr.addWidget(self.btn_clear)
         lr.addWidget(self.btn_save)
-
-        # ---- 手动发送 ----
         self.ed_id = QLineEdit("7FF")
         self.ed_id.setMaximumWidth(60)
         self.ed_data = QLineEdit("01 00 33 3C 00 00 00 00")
         self.btn_send = QPushButton("发送")
         sr = QHBoxLayout()
-        sr.addWidget(QLabel("手动发送  ID(hex)"))
-        sr.addWidget(self.ed_id)
-        sr.addWidget(QLabel("数据(hex)"))
+        for w in (QLabel("手动发送  ID(hex)"), self.ed_id, QLabel("数据(hex)")):
+            sr.addWidget(w)
         sr.addWidget(self.ed_data, 1)
         sr.addWidget(self.btn_send)
         ll = QVBoxLayout(lg)
@@ -87,68 +54,65 @@ class ScanLogTab(QWidget):
         ll.addWidget(self.log, 1)
         ll.addLayout(sr)
 
+        hg = QGroupBox("往返延迟（发送 → 收到应答，仅问答式协议）")
+        self.hist = pg.PlotWidget(background="w")
+        self.hist.setLabel("bottom", "延迟", units="s")
+        self.hist.setLabel("left", "次数")
+        self.hist.showGrid(x=True, y=True, alpha=0.3)
+        self.bars = pg.BarGraphItem(x=[], height=[], width=1e-4, brush="#1565c0")
+        self.hist.addItem(self.bars)
+        self.lbl_lat = QLabel("—")
+        self.btn_lat_clear = QPushButton("清空统计")
+        hl = QVBoxLayout(hg)
+        r = QHBoxLayout()
+        r.addWidget(self.lbl_lat, 1)
+        r.addWidget(self.btn_lat_clear)
+        hl.addLayout(r)
+        hl.addWidget(self.hist)
+
         sp = QSplitter(Qt.Vertical)
-        sp.addWidget(sg)
         sp.addWidget(lg)
-        sp.setStretchFactor(1, 1)
+        sp.addWidget(hg)
+        sp.setSizes([600, 250])
         lay = QVBoxLayout(self)
         lay.addWidget(sp)
 
-        self.btn_scan.clicked.connect(self._scan)
         self.btn_clear.clicked.connect(self.log.clear)
         self.btn_save.clicked.connect(self._save)
         self.btn_send.clicked.connect(self._send)
-        self.chk_log.toggled.connect(self._log_toggled)
+        self.chk_log.toggled.connect(lambda on: self.worker and setattr(self.worker, "log_enabled", on))
+        self.btn_lat_clear.clicked.connect(lambda: self.worker and self.worker.latencies.clear())
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._hist)
+        self.timer.start(500)
         self.set_bound(None)
 
     def set_bound(self, worker):
         self.worker = worker
-        for b in (self.btn_scan, self.btn_send):
-            b.setEnabled(worker is not None)
+        self.btn_send.setEnabled(worker is not None)
         if worker:
             worker.log_enabled = self.chk_log.isChecked()
+        self.driver = None
 
-    def _log_toggled(self, on: bool):
-        if self.worker:
-            self.worker.log_enabled = on
+    def set_driver(self, d):
+        self.driver = d
 
-    def on_state(self, s: dict):
-        if self.worker:
-            self.btn_scan.setEnabled(not s["blocked"] and not s["scanning"])
+    def _hist(self):
+        w = self.worker
+        if w is None or not self.isVisible():
+            return
+        xs = np.array(list(w.latencies))
+        if len(xs) < 2:
+            self.lbl_lat.setText("暂无数据（大疆为主动广播，无往返延迟）" if self.driver and
+                                 not self.driver.caps.enable_cmd else "暂无数据")
+            return
+        h, e = np.histogram(xs, bins=40)
+        self.bars.setOpts(x=(e[:-1] + e[1:]) / 2, height=h, width=(e[1] - e[0]) * 0.9)
+        p = np.percentile(xs, [50, 95, 99])
+        self.lbl_lat.setText(f"n={len(xs)}  p50 {p[0] * 1e3:.2f} ms  p95 {p[1] * 1e3:.2f} ms  "
+                             f"p99 {p[2] * 1e3:.2f} ms  max {xs.max() * 1e3:.2f} ms")
 
-    # ---- 扫描 ----
-    def _scan(self):
-        a, b = self.sp_from.value(), self.sp_to.value()
-        if a > b:
-            a, b = b, a
-        self.tbl.setRowCount(0)
-        self.prog.setRange(0, b - a + 1)
-        self.prog.setValue(0)
-        self.btn_scan.setEnabled(False)
-        self.worker.start_scan(range(a, b + 1), self.sp_win.value() / 1000.0)
-
-    def on_scan_progress(self, i: int, n: int):
-        self.prog.setRange(0, n)
-        self.prog.setValue(i)
-
-    def on_scan_done(self, found):
-        self.tbl.setRowCount(0)
-        for mid, cid, st in found:
-            r = self.tbl.rowCount()
-            self.tbl.insertRow(r)
-            for c, txt in enumerate((str(mid), f"0x{cid:03X}", f"{st.pos:+.4f} rad", str(st.err),
-                                     f"{st.t_mos}/{st.t_rotor}")):
-                it = QTableWidgetItem(txt)
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.tbl.setItem(r, c, it)
-            b = QPushButton("使用此电机")
-            b.clicked.connect(lambda _=False, m=mid, c=cid: self.use_motor.emit(m, c))
-            self.tbl.setCellWidget(r, 5, b)
-        self.append_text(f"# 扫描完成，发现 {len(found)} 台: " +
-                         ", ".join(f"ID{m}→Master 0x{c:X}" for m, c, _ in found))
-
-    # ---- 日志 ----
-    def _filter_ids(self) -> set[int] | None:
+    def _filter_ids(self):
         t = self.ed_filter.text().strip()
         if not t:
             return None
@@ -166,43 +130,23 @@ class ScanLogTab(QWidget):
         if self.t0 is None:
             self.t0 = frames[0].t
         flt = self._filter_ids()
-        hide = self.chk_hide_mit.isChecked()
-        mid = self.worker.motor_id if self.worker else -1
-        mst = self.worker.master_id if self.worker else -1
+        hide = self.chk_hide.isChecked()
+        mine = self.chk_mine.isChecked()
+        d = self.driver
         lines = []
         for f in frames:
             if flt is not None and f.can_id not in flt:
                 continue
-            note = self._describe(f, mid, mst)
-            if hide and note in ("MIT控制", "状态", "查询状态"):
+            note = d.describe(f.can_id, f.data, f.tx) if d else ""
+            if mine and not note:
+                continue
+            if hide and (note in ("MIT控制", "查询状态", "反馈") or note.startswith("状态 ")
+                         or note.startswith("电流指令")):
                 continue
             lines.append(f"{f.t - self.t0:10.4f}  {'TX' if f.tx else 'RX'}  {f.can_id:03X}  "
                          f"[{len(f.data)}] {P.hexdata(f.data):<23}  {note}")
         if lines:
             self.log.appendPlainText("\n".join(lines[-1000:]))
-
-    def _describe(self, f, mid: int, mst: int) -> str:
-        d = f.data
-        if len(d) != 8:
-            return ""
-        if f.tx:
-            if f.can_id == P.CONFIG_ID:
-                return {P.CMD_READ: f"读 0x{d[3]:02X}", P.CMD_WRITE: f"写 0x{d[3]:02X}",
-                        P.CMD_SAVE: "保存" if d[3] == 1 else f"0xAA/{d[3]:02X}",
-                        P.CMD_STATE: "查询状态"}.get(d[2], "")
-            if P.is_special(d):
-                return P.SPECIAL_NAMES[d[7]]
-            return "MIT控制"
-        if d[2] in P.CONFIG_CMDS and (d[0] | (d[1] << 8)) == mid:
-            r = P.REG_BY_RID.get(d[3])
-            if d[2] == P.CMD_SAVE:
-                return "保存应答"
-            if r:
-                return f"应答 {r.name} = {P.decode_value(r.typ, d[4:8]):.6g}"
-            return "应答"
-        if f.can_id == mst:
-            return "状态"
-        return ""
 
     def append_text(self, s: str):
         self.log.appendPlainText(s)
@@ -222,7 +166,6 @@ class ScanLogTab(QWidget):
         except ValueError as e:
             QMessageBox.warning(self, "发送", str(e))
             return
-        if self.worker.enabled and P.is_special(data.ljust(8, b"\0")):
-            if QMessageBox.question(self, "发送", "电机使能中，确认发送模式切换帧？") != QMessageBox.Yes:
-                return
-        self.worker.send_raw(cid, data)
+        if QMessageBox.question(self, "手动发送", f"发送 {cid:03X} [{P.hexdata(data)}]？\n"
+                                "手动帧不经过安全限制。") == QMessageBox.Yes:
+            self.worker.send_raw(cid, data)

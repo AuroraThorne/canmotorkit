@@ -1,9 +1,8 @@
-"""连接面板：通道/波特率/电机 ID/Master ID/型号预设。"""
+"""① PCAN 连接：通道（含「演示台」）/ 波特率 / 连接。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
-                               QPushButton, QSpinBox, QWidget)
+from PySide6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QPushButton, QWidget
 
 from canmotorkit.core.pcan_basic import BAUDRATES, USB_CHANNELS
 
@@ -13,46 +12,30 @@ SIM_LABEL = "演示台（虚拟电机，无需硬件）"
 class ConnectionPanel(QGroupBox):
     connect_requested = Signal(dict)
     disconnect_requested = Signal()
-    strict_changed = Signal(bool)
 
     def __init__(self, parent=None):
-        super().__init__("连接", parent)
+        super().__init__("① PCAN 连接", parent)
         self.pcan_error = ""
         self.cb_channel = QComboBox()
+        self.cb_channel.setToolTip("「演示台」包含 HM9816G9、达妙 J8009P、大疆 M3508/M2006/GM6020 虚拟电机")
         self.btn_refresh = QPushButton("刷新")
-        ch_row = QWidget()
-        h = QHBoxLayout(ch_row)
+        row = QWidget()
+        h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(self.cb_channel, 1)
         h.addWidget(self.btn_refresh)
-
         self.cb_baud = QComboBox()
         self.cb_baud.addItems(list(BAUDRATES))
-        self.cb_baud.setToolTip("CAN 版电机固定 1 Mbps（仅 CAN FD 版支持改波特率）")
-        self.sp_id = QSpinBox()
-        self.sp_id.setRange(1, 127)
-        self.sp_id.setValue(1)
-        self.sp_id.setToolTip("电机接收 ID（控制帧帧 ID），出厂默认 1")
-        self.sp_master = QSpinBox()
-        self.sp_master.setRange(0, 0x7FE)
-        self.sp_master.setValue(0)
-        self.sp_master.setToolTip("电机应答帧 ID（MASTER_ID），出厂默认 0")
-        self.chk_strict = QCheckBox("校验状态帧 ID 低 4 位")
+        self.cb_baud.setToolTip("达妙/HM/大疆经典 CAN 均为 1 Mbps")
         self.btn_connect = QPushButton("连接")
         self.btn_connect.setMinimumHeight(30)
-
         f = QFormLayout(self)
-        f.addRow("通道", ch_row)
+        f.addRow("通道", row)
         f.addRow("波特率", self.cb_baud)
-        f.addRow("电机 ID", self.sp_id)
-        f.addRow("Master ID", self.sp_master)
-        f.addRow(self.chk_strict)
         f.addRow(self.btn_connect)
-
         self._connected = False
         self.btn_refresh.clicked.connect(self.refresh_channels)
         self.btn_connect.clicked.connect(self._on_click)
-        self.chk_strict.toggled.connect(self.strict_changed)
         self.refresh_channels()
 
     def refresh_channels(self):
@@ -77,15 +60,8 @@ class ConnectionPanel(QGroupBox):
 
     def params(self) -> dict:
         kind, handle = self.cb_channel.currentData()
-        return {
-            "sim": kind == "sim",
-            "channel": handle,
-            "channel_name": self.cb_channel.currentText(),
-            "baud": BAUDRATES[self.cb_baud.currentText()],
-            "motor_id": self.sp_id.value(),
-            "master_id": self.sp_master.value(),
-            "strict": self.chk_strict.isChecked(),
-        }
+        return {"sim": kind == "sim", "channel": handle, "channel_name": self.cb_channel.currentText(),
+                "baud": BAUDRATES[self.cb_baud.currentText()]}
 
     def _on_click(self):
         if self._connected:
@@ -96,9 +72,5 @@ class ConnectionPanel(QGroupBox):
     def set_connected(self, on: bool):
         self._connected = on
         self.btn_connect.setText("断开" if on else "连接")
-        for w in (self.cb_channel, self.btn_refresh, self.cb_baud, self.sp_id, self.sp_master):
+        for w in (self.cb_channel, self.btn_refresh, self.cb_baud):
             w.setEnabled(not on)
-
-    def set_ids(self, motor_id: int, master_id: int):
-        self.sp_id.setValue(motor_id)
-        self.sp_master.setValue(master_id)

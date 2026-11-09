@@ -136,7 +136,7 @@ def test_dji_current(app):
         w.enable()                                               # 软件使能 + 自动开发送
         assert pump(app, 0.5, lambda: abs(m.cur - 2.0) < 0.01)
         assert pump(app, 1.0, lambda: w.last_fb.vel > 1.0)
-        assert abs(w.last_fb.out - 2.0) < 0.2
+        assert pump(app, 0.5, lambda: abs(w.last_fb.out - 2.0) < 0.2)
         w.disable()
         assert pump(app, 0.3, lambda: m.cur == 0.0)
     finally:

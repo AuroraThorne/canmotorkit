@@ -1,19 +1,21 @@
-"""测试信号页：阶跃/方波/正弦/扫频，自动录制并给出阶跃指标，导出 CSV。"""
+"""响应测试页：只发电流/扭矩激励，得到电流→速度、电流→位置的幅频/相频曲线，并给出模型与 PID 建议。"""
 from __future__ import annotations
 
 import csv
+import math
 
+import numpy as np
+import pyqtgraph as pg
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
-                               QVBoxLayout, QWidget)
+                               QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
-from canmotorkit.analysis.siggen import KINDS, SignalGen, step_metrics
-
-CHANNELS = {"p": "位置 p (rad)", "v": "速度 v (rad/s)", "t": "扭矩 t (Nm)"}
-REC_COLS = ["t", "p_cmd", "v_cmd", "t_cmd", "kp", "kd", "p_fb", "v_fb", "t_fb", "t_mos", "t_rotor", "err"]
+from canmotorkit.analysis import sysid
+from canmotorkit.analysis.runs import EXCITE_KINDS, ExciteConfig, ExciteRun
 
 
-def _spin(lo, hi, val, dec=3, step=0.1, suffix=""):
+def dspin(lo, hi, val, dec=3, step=0.1, suffix=""):
     s = QDoubleSpinBox()
     s.setRange(lo, hi)
     s.setDecimals(dec)
@@ -25,187 +27,243 @@ def _spin(lo, hi, val, dec=3, step=0.1, suffix=""):
 
 
 class TestTab(QWidget):
+    suggestion_ready = Signal(object)        # sysid.Suggestion
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = None
-        self.control = None             # ControlPanel，用于读取当前 kp/kd 与位置
-        self.recording = False
-        self.rec: list = []
-        self.channel = "p"
+        self.driver = None
+        self.run: ExciteRun | None = None
+        self.model: sysid.Model | None = None
+        self.sugg: sysid.Suggestion | None = None
 
         self.cb_kind = QComboBox()
-        for k, v in KINDS.items():
+        for k, v in EXCITE_KINDS.items():
             self.cb_kind.addItem(v, k)
         self.cb_kind.setCurrentIndex(1)
-        self.cb_ch = QComboBox()
-        for k, v in CHANNELS.items():
-            self.cb_ch.addItem(v, k)
-        self.sp_amp = _spin(-100, 100, 0.5)
-        self.sp_off = _spin(-100, 100, 0.0)
-        self.chk_rel = QComboBox()
-        self.chk_rel.addItems(["偏置 = 当前位置/目标 + 偏置", "偏置 = 绝对值"])
-        self.sp_freq = _spin(0.01, 100, 1.0, 2, 0.5, " Hz")
-        self.sp_freq2 = _spin(0.01, 200, 10.0, 2, 1, " Hz")
-        self.sp_dur = _spin(0.1, 600, 3.0, 2, 0.5, " s")
-        self.sp_delay = _spin(0, 60, 0.5, 2, 0.1, " s")
-        self.sp_kp = _spin(0, 500, 20.0, 2, 1)
-        self.sp_kd = _spin(0, 5, 1.0, 3, 0.05)
+        self.sp_amp = dspin(0, 100, 0.5, 3, 0.1)
+        self.sp_off = dspin(-100, 100, 0.0, 3, 0.1)
+        self.sp_on = dspin(0.01, 10, 0.3, 3, 0.05, " s")
+        self.sp_f0 = dspin(0.05, 200, 1.0, 2, 0.5, " Hz")
+        self.sp_f1 = dspin(0.1, 300, 30.0, 2, 1.0, " Hz")
+        self.sp_n = QSpinBox()
+        self.sp_n.setRange(2, 40)
+        self.sp_n.setValue(10)
+        self.sp_cyc = QSpinBox()
+        self.sp_cyc.setRange(2, 50)
+        self.sp_cyc.setValue(6)
+        self.sp_dur = dspin(0.5, 120, 5.0, 1, 1.0, " s")
+        self.sp_bias = dspin(0, 100, 0.0, 2, 0.5, " rad/s")
+        self.sp_bias.setToolTip("大于 0 时叠加一个弱速度环，让电机保持平均转速以越过静摩擦。\n"
+                                "辨识使用实际下发的电流与实测速度，偏置环不影响结果。")
+        self.sp_bkp = dspin(0, 100, 0.05, 4, 0.01)
+        self.sp_bkp.setToolTip("偏置速度环增益（输出单位 / (rad/s)），应远小于正常速度环")
+        self.lbl_est = QLabel()
+        self.lbl_est.setWordWrap(True)
+        self.lbl_est.setStyleSheet("color:#795548")
 
-        g = QGroupBox("信号")
+        g = QGroupBox("激励（只发送电流/扭矩）")
         f = QFormLayout(g)
+        self.lbl_amp = QLabel("幅值")
         f.addRow("类型", self.cb_kind)
-        f.addRow("作用通道", self.cb_ch)
-        f.addRow("幅值", self.sp_amp)
-        f.addRow("偏置", self.sp_off)
-        f.addRow("偏置模式", self.chk_rel)
-        f.addRow("频率 / 起始频率", self.sp_freq)
-        f.addRow("扫频终止频率", self.sp_freq2)
-        f.addRow("持续时间", self.sp_dur)
-        f.addRow("阶跃延时", self.sp_delay)
-        g2 = QGroupBox("增益（点“开始”时写入控制面板并应用）")
-        f2 = QFormLayout(g2)
-        f2.addRow("Kp", self.sp_kp)
-        f2.addRow("Kd", self.sp_kd)
-        self.lbl_hint = QLabel()
-        self.lbl_hint.setWordWrap(True)
-        self.lbl_hint.setStyleSheet("color:#795548")
-
-        self.btn_start = QPushButton("开始")
+        f.addRow(self.lbl_amp, self.sp_amp)
+        f.addRow("偏置输出", self.sp_off)
+        f.addRow("阶跃持续时间", self.sp_on)
+        f.addRow("起始频率", self.sp_f0)
+        f.addRow("终止频率", self.sp_f1)
+        f.addRow("频点数", self.sp_n)
+        f.addRow("每频点周期", self.sp_cyc)
+        f.addRow("时长（扫频/PRBS）", self.sp_dur)
+        f.addRow("偏置速度", self.sp_bias)
+        f.addRow("偏置环增益", self.sp_bkp)
+        f.addRow(self.lbl_est)
+        self.btn_start = QPushButton("开始测试")
         self.btn_start.setStyleSheet("QPushButton{font-weight:bold;min-height:28px}")
         self.btn_stop = QPushButton("停止")
-        self.btn_csv = QPushButton("导出录制 CSV")
-        bar = QHBoxLayout()
-        bar.addWidget(self.btn_start)
-        bar.addWidget(self.btn_stop)
-        bar.addWidget(self.btn_csv)
-        self.out = QPlainTextEdit()
-        self.out.setReadOnly(True)
-        self.out.setMaximumBlockCount(500)
-
+        self.btn_csv = QPushButton("导出数据")
+        self.btn_use = QPushButton("把建议参数带入闭环测试")
+        self.btn_use.setEnabled(False)
+        b = QHBoxLayout()
+        b.addWidget(self.btn_start)
+        b.addWidget(self.btn_stop)
+        b.addWidget(self.btn_csv)
+        note = QLabel("前提：电机已使能、没有安全锁存。全程受左侧「安全限制」保护，超限即零电流并中止。\n"
+                      "电流→位置在低频位移很大，建议开启位置窗口。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:gray")
         left = QVBoxLayout()
         left.addWidget(g)
-        left.addWidget(g2)
-        left.addWidget(self.lbl_hint)
-        left.addLayout(bar)
+        left.addLayout(b)
+        left.addWidget(self.btn_use)
+        left.addWidget(note)
         left.addStretch(1)
-        lay = QHBoxLayout(self)
-        lay.addLayout(left, 0)
-        lay.addWidget(self.out, 1)
+        lw = QWidget()
+        lw.setLayout(left)
+        lw.setMaximumWidth(380)
 
-        self.cb_kind.currentIndexChanged.connect(self._update_ui)
-        self.cb_ch.currentIndexChanged.connect(self._update_ui)
+        self.glw = pg.GraphicsLayoutWidget()
+        self.glw.setBackground("w")
+        self.p_mag = self.glw.addPlot(row=0, col=0)
+        self.p_ph = self.glw.addPlot(row=1, col=0)
+        for p in (self.p_mag, self.p_ph):
+            p.setLogMode(x=True, y=False)
+            p.showGrid(x=True, y=True, alpha=0.3)
+            p.addLegend(offset=(5, 5))
+        self.p_ph.setXLink(self.p_mag)
+        self.p_mag.setLabel("left", "幅值", units="dB")
+        self.p_ph.setLabel("left", "相位", units="°")
+        self.p_ph.setLabel("bottom", "频率", units="Hz")
+        sym = dict(symbol="o", symbolSize=6)
+        self.c = {
+            "mv": self.p_mag.plot(name="电流→速度", pen=pg.mkPen("#1565c0", width=2), symbolBrush="#1565c0", **sym),
+            "mp": self.p_mag.plot(name="电流→位置", pen=pg.mkPen("#e65100", width=2), symbolBrush="#e65100", **sym),
+            "mm": self.p_mag.plot(name="拟合模型(速度)", pen=pg.mkPen("#9e9e9e", width=1.5, style=Qt.DashLine)),
+            "pv": self.p_ph.plot(name="电流→速度", pen=pg.mkPen("#1565c0", width=2), symbolBrush="#1565c0", **sym),
+            "pp": self.p_ph.plot(name="电流→位置", pen=pg.mkPen("#e65100", width=2), symbolBrush="#e65100", **sym),
+            "pm": self.p_ph.plot(name="拟合模型(速度)", pen=pg.mkPen("#9e9e9e", width=1.5, style=Qt.DashLine)),
+        }
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setMaximumBlockCount(1000)
+        sp = QSplitter(Qt.Vertical)
+        sp.addWidget(self.glw)
+        sp.addWidget(self.out)
+        sp.setSizes([500, 200])
+        lay = QHBoxLayout(self)
+        lay.addWidget(lw)
+        lay.addWidget(sp, 1)
+
+        self.cb_kind.currentIndexChanged.connect(self._update)
+        for w in (self.sp_amp, self.sp_f0, self.sp_f1, self.sp_n, self.sp_cyc, self.sp_dur, self.sp_on):
+            w.valueChanged.connect(self._update)
         self.btn_start.clicked.connect(self.start)
-        self.btn_stop.clicked.connect(self.stop)
+        self.btn_stop.clicked.connect(lambda: self.worker and self.worker.stop_run())
         self.btn_csv.clicked.connect(self.export)
-        self._update_ui()
+        self.btn_use.clicked.connect(lambda: self.sugg and self.suggestion_ready.emit(self.sugg))
+        self._update()
         self.set_bound(None)
 
     def set_bound(self, worker):
         self.worker = worker
-        self.btn_start.setEnabled(worker is not None)
-        self.btn_stop.setEnabled(False)
+        self.set_driver(None)
 
-    def _update_ui(self):
+    def set_driver(self, d):
+        self.driver = d
+        on = self.worker is not None and d is not None
+        self.btn_start.setEnabled(on)
+        self.btn_stop.setEnabled(False)
+        u = d.out_unit if d else ""
+        for s in (self.sp_amp, self.sp_off):
+            s.setSuffix(f" {u}" if u else "")
+        self.sp_bkp.setSuffix(f" {u}/(rad/s)" if u else "")
+        if d is not None:
+            self.sp_amp.setMaximum(d.out_max)
+            self.sp_off.setRange(-d.out_max, d.out_max)
+
+    def on_state(self, s: dict):
+        if self.driver is None:
+            return
+        running = s["running"]
+        self.btn_start.setEnabled(not running and s["active"] and not s["tripped"])
+        self.btn_stop.setEnabled(running)
+
+    def _update(self):
         k = self.cb_kind.currentData()
-        ch = self.cb_ch.currentData()
-        self.sp_freq.setEnabled(k in ("sine", "square", "chirp"))
-        self.sp_freq2.setEnabled(k == "chirp")
-        self.sp_delay.setEnabled(k == "step")
-        hints = {
-            "p": "位置测试：需 kp>0、kd>0（kd=0 会振荡）。建议从小幅值、小 kp 开始。",
-            "v": "速度测试：建议 kp=0、kd>0，由 kd 决定速度环刚度。",
-            "t": "扭矩测试：kp=kd=0 时为纯扭矩输出，空载会持续加速，请注意安全！",
-        }
-        self.lbl_hint.setText(hints[ch])
-        defaults = {"p": (20.0, 1.0, 0.5), "v": (0.0, 1.0, 2.0), "t": (0.0, 0.0, 0.5)}
-        kp, kd, amp = defaults[ch]
-        if ch != self.channel:
-            self.channel = ch
-            self.sp_kp.setValue(kp)
-            self.sp_kd.setValue(kd)
-            self.sp_amp.setValue(amp)
+        self.sp_on.setEnabled(k == "step")
+        for w in (self.sp_f0, self.sp_f1):
+            w.setEnabled(k != "step")
+        self.sp_n.setEnabled(k == "stepsine")
+        self.sp_cyc.setEnabled(k == "stepsine")
+        self.sp_dur.setEnabled(k in ("chirp", "prbs"))
+        try:
+            run = ExciteRun(self._cfg())
+            self.lbl_est.setText(f"预计时长 {run.total:.1f} s")
+        except Exception:
+            self.lbl_est.setText("")
+
+    def _cfg(self) -> ExciteConfig:
+        return ExciteConfig(kind=self.cb_kind.currentData(), amp=self.sp_amp.value(),
+                            offset=self.sp_off.value(), step_on=self.sp_on.value(),
+                            f0=self.sp_f0.value(), f1=max(self.sp_f1.value(), self.sp_f0.value() * 1.01),
+                            n_freq=self.sp_n.value(), cycles=self.sp_cyc.value(),
+                            duration=self.sp_dur.value(), bias_vel=self.sp_bias.value(),
+                            bias_kp=self.sp_bkp.value())
 
     def start(self):
         w = self.worker
-        if not w:
+        if not w or not self.driver:
             return
-        if not w.enabled:
-            QMessageBox.information(self, "测试", "请先在控制面板使能电机")
+        if not w.active:
+            QMessageBox.information(self, "响应测试", "请先使能电机")
             return
-        ch = self.cb_ch.currentData()
-        if ch == "p" and self.sp_kd.value() == 0:
-            QMessageBox.warning(self, "测试", "位置控制时 kd 不能为 0（手册要求）")
-            return
-        cur = w.get_target()
-        base = 0.0
-        if self.chk_rel.currentIndex() == 0:
-            if ch == "p":
-                base = w.last_status.pos if w.last_status else cur.p
-            else:
-                base = getattr(cur, ch)
-        gen = SignalGen(self.cb_kind.currentData(), self.sp_amp.value(), base + self.sp_off.value(),
-                        self.sp_freq.value(), self.sp_freq2.value(), self.sp_dur.value(),
-                        self.sp_delay.value())
-        # 设置增益与初始值，并同步控制面板
-        cur.kp, cur.kd = self.sp_kp.value(), self.sp_kd.value()
-        if ch == "p":
-            cur.p = gen.value(0.0)
-        if self.control:
-            self.control.set_and_apply(cur)
-        else:
-            w.set_target(cur)
-        self.rec = []
-        self.recording = True
-        w.start_signal(gen, ch)
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.out.appendPlainText(f"▶ {KINDS[gen.kind]} 通道={ch} 幅值={gen.amp:g} 偏置={gen.offset:.4f} "
-                                 f"kp={cur.kp:g} kd={cur.kd:g} 时长={gen.duration:g}s")
+        cfg = self._cfg()
+        lim = w.safety.limits.out_max
+        if lim > 0 and abs(cfg.offset) + cfg.amp > lim:
+            if QMessageBox.question(self, "响应测试", f"偏置+幅值超过安全限幅 ±{lim:g}，"
+                                    "激励会被削顶，影响辨识结果。继续？") != QMessageBox.Yes:
+                return
+        self.run = ExciteRun(cfg)
+        for c in self.c.values():
+            c.setData([], [])
+        w.start_run(self.run)
+        self.out.appendPlainText(f"▶ {self.run.title}，预计 {self.run.total:.1f} s")
 
-    def stop(self):
-        if self.worker:
-            self.worker.stop_signal()
-
-    def on_samples(self, samples):
-        if self.recording:
-            self.rec.extend(s for s in samples if s.mit)
-
-    def on_finished(self):
-        if not self.recording:
+    def on_run_finished(self, run):
+        if run is not self.run:
             return
-        self.recording = False
-        self.btn_start.setEnabled(self.worker is not None)
-        self.btn_stop.setEnabled(False)
-        n = len(self.rec)
-        self.out.appendPlainText(f"■ 结束，录制 {n} 点")
-        if n < 2:
+        n = len(run.rec)
+        self.out.appendPlainText(f"■ 结束（{run.reason or '完成'}），记录 {n} 点")
+        if n < 10:
             return
-        ch = self.channel
-        fbk = {"p": lambda s: s.st.pos, "v": lambda s: s.st.vel, "t": lambda s: s.st.torque}[ch]
-        t = [s.t for s in self.rec]
-        cmd = [getattr(s.cmd, ch) for s in self.rec]
-        fb = [fbk(s) for s in self.rec]
-        err = [c - y for c, y in zip(cmd, fb)]
-        rms = (sum(e * e for e in err) / n) ** 0.5
-        self.out.appendPlainText(f"  跟踪误差 RMS = {rms:.5f}，最大 |e| = {max(map(abs, err)):.5f}")
-        if self.cb_kind.currentData() == "step":
-            m = step_metrics(t, cmd, fb)
-            self.out.appendPlainText("  " + (m.text() if m else "未检测到阶跃"))
+        unit = self.driver.out_unit if self.driver else ""
+        lat = self.worker.latency_stats().get("p50", 0.002) if self.worker else 0.002
+        rate = self.worker.rate_hz if self.worker else 500
+        if run.cfg.kind == "step":
+            m = sysid.step_model(run.rec, run.cfg.amp, run.cfg.step_delay, run.cfg.step_on, unit)
+            if m is None:
+                self.out.appendPlainText("  阶跃辨识失败：电机可能未转动（幅值低于静摩擦？）")
+                return
+            self._show_model(m, None, lat, rate)
+            return
+        bode = sysid.bode_from_run(run)
+        if bode is None:
+            self.out.appendPlainText("  频响计算失败：有效数据不足（电机是否卡在静摩擦？可加偏置速度）")
+            return
+        f = bode.f
+        db = lambda x: 20 * np.log10(np.maximum(x, 1e-12))
+        self.c["mv"].setData(f, db(bode.mag_v))
+        self.c["mp"].setData(f, db(bode.mag_p))
+        self.c["pv"].setData(f, bode.ph_v)
+        self.c["pp"].setData(f, bode.ph_p)
+        bad = int(np.sum(bode.coh < 0.6))
+        if bad:
+            self.out.appendPlainText(f"  注意：{bad} 个频点拟合质量低（噪声/摩擦/饱和）")
+        m = sysid.fit_model(bode, unit)
+        if m is not None:
+            w = 2 * np.pi * f
+            g = np.exp(-1j * w * m.Td) / (m.J * 1j * w + m.b)
+            self.c["mm"].setData(f, db(np.abs(g)))
+            self.c["pm"].setData(f, np.degrees(np.unwrap(np.angle(g))))
+            self._show_model(m, bode, lat, rate)
+
+    def _show_model(self, m, bode, lat, rate):
+        self.model = m
+        self.sugg = sysid.suggest(m, latency=lat, rate_hz=rate)
+        self.out.appendPlainText("  模型：" + m.text())
+        self.out.appendPlainText("  PID 建议：\n    " + self.sugg.text().replace("\n", "\n    "))
+        self.btn_use.setEnabled(True)
 
     def export(self):
-        if not self.rec:
-            QMessageBox.information(self, "导出", "没有录制数据")
+        if self.run is None or not len(self.run.rec):
+            QMessageBox.information(self, "导出", "没有数据")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出录制", "test.csv", "CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "导出响应测试", "response.csv", "CSV (*.csv)")
         if not path:
             return
-        t0 = self.rec[0].t
+        r = self.run.rec
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(REC_COLS)
-            for s in self.rec:
-                c, st = s.cmd, s.st
-                w.writerow([f"{s.t - t0:.6f}", f"{c.p:.6g}", f"{c.v:.6g}", f"{c.t:.6g}", f"{c.kp:.6g}",
-                            f"{c.kd:.6g}", f"{st.pos:.6g}", f"{st.vel:.6g}", f"{st.torque:.6g}",
-                            st.t_mos, st.t_rotor, st.err])
+            w.writerow(["t", "u", "excite", "pos", "vel", "out_fb", "seg"])
+            for row in zip(r.t, r.u, r.ref, r.pos, r.vel, r.fb_out, r.seg):
+                w.writerow(["" if isinstance(x, float) and math.isnan(x) else f"{x:.7g}" for x in row])
         self.out.appendPlainText(f"已导出 {path}")

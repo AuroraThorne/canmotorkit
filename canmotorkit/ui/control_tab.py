@@ -1,15 +1,13 @@
-"""MIT 控制面板：使能/失能/急停/清错/设零、五参数（手动应用）、实时读数、通信频率。
+"""控制页：电流/扭矩（主页）+ MIT（子页，仅 MIT 电机）+ 实时反馈。
 
-约定：
-- 参数默认全 0；修改后必须点“应用”（或回车）才写入下发目标，没有自动更新。
-- 使能/失能按钮不锁定，电机是否使能以状态帧状态码为准。
-- 按通信频率发帧：电机已使能发 MIT 控制帧，否则发 0xCC 查询帧。
+约定：参数默认全 0；修改后黄色标记，必须点“应用”或回车才下发；单位按厂家协议。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QPushButton, QSlider, QSpinBox, QToolButton, QVBoxLayout)
+                               QLabel, QPushButton, QSlider, QTabWidget, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from canmotorkit.drivers import dm_protocol as P
 
@@ -100,88 +98,113 @@ class _Row:
         self._mark()
 
 
-class ControlPanel(QGroupBox):
-    rate_changed = Signal(float)            # 通信频率
+class _Params(QWidget):
+    """一组参数行 + 应用/撤销/全部置0。"""
 
-    def __init__(self, parent=None):
-        super().__init__("MIT 控制", parent)
-        self.worker = None
-
-        def btn(text, style="", h=28):
-            b = QPushButton(text)
-            b.setFocusPolicy(Qt.NoFocus)      # 防止空格键误触发
-            b.setMinimumHeight(h)
-            if style:
-                b.setStyleSheet(style)
-            return b
-
-        self.btn_enable = btn("使能 (FC)")
-        self.btn_disable = btn("失能 (FD)")
-        self.btn_clear = btn("清错 (FB)")
-        self.btn_zero = btn("设零点 (FE)")
-        self.btn_zero.setToolTip("将当前输出轴位置设为零点（需失能）")
-        self.lbl_motor = QLabel("电机状态：—")
-        self.lbl_motor.setAlignment(Qt.AlignCenter)
-        self.lbl_motor.setMinimumHeight(26)
-
-        top = QGridLayout()
-        top.addWidget(self.lbl_motor, 0, 0, 1, 2)
-        top.addWidget(self.btn_enable, 1, 0)
-        top.addWidget(self.btn_disable, 1, 1)
-        top.addWidget(self.btn_clear, 2, 0)
-        top.addWidget(self.btn_zero, 2, 1)
-
-        # 参数
-        pg = QGroupBox("目标参数（修改后点“应用”或按回车生效）")
-        grid = QGridLayout(pg)
+    def __init__(self, specs, on_apply):
+        super().__init__()
+        self.on_apply = on_apply
+        self.rows = {}
+        grid = QGridLayout(self)
         grid.setColumnStretch(1, 1)
-        args = (self._edited, self.apply)
-        self.rows = {
-            "p": _Row(grid, 0, "位置 p", "rad", 4, 0.01, *args),
-            "v": _Row(grid, 1, "速度 v", "rad/s", 3, 0.1, *args),
-            "kp": _Row(grid, 2, "Kp", "", 2, 1.0, *args),
-            "kd": _Row(grid, 3, "Kd", "", 3, 0.05, *args),
-            "t": _Row(grid, 4, "前馈扭矩 t", "Nm", 3, 0.1, *args),
-        }
-        self.btn_apply = btn("应用", "QPushButton:enabled{font-weight:bold}")
-        self.btn_revert = btn("撤销修改")
-        self.btn_all0 = btn("全部置 0")
+        for i, (k, label, unit, dec, step) in enumerate(specs):
+            self.rows[k] = _Row(grid, i, label, unit, dec, step, self._edited, self.apply)
+        n = len(specs)
+        self.btn_apply = QPushButton("应用（回车）")
+        self.btn_apply.setStyleSheet("QPushButton:enabled{font-weight:bold;background:#fff3c4}")
+        self.btn_revert = QPushButton("撤销修改")
+        self.btn_all0 = QPushButton("全部置 0")
         self.btn_all0.setToolTip("只修改界面值，仍需应用")
-        self.lbl_applied = QLabel()
-        self.lbl_applied.setStyleSheet("color:gray;font-family:Consolas,monospace")
-        self.lbl_applied.setWordWrap(True)
+        for b in (self.btn_apply, self.btn_revert, self.btn_all0):
+            b.setFocusPolicy(Qt.NoFocus)
         r = QHBoxLayout()
         r.addWidget(self.btn_apply)
         r.addWidget(self.btn_revert)
         r.addStretch(1)
         r.addWidget(self.btn_all0)
-        grid.addLayout(r, 5, 0, 1, 5)
-        grid.addWidget(self.lbl_applied, 6, 0, 1, 5)
+        grid.addLayout(r, n, 0, 1, 5)
+        self.lbl_applied = QLabel()
+        self.lbl_applied.setStyleSheet("color:gray;font-family:Consolas,monospace")
+        grid.addWidget(self.lbl_applied, n + 1, 0, 1, 5)
+        self.btn_apply.clicked.connect(self.apply)
+        self.btn_revert.clicked.connect(lambda: [x.set_value(x.applied) for x in self.rows.values()])
+        self.btn_all0.clicked.connect(lambda: [x.set_value(0.0) for x in self.rows.values()])
+        self._show()
 
-        # 通信 / 量程
-        fg = QGroupBox("通信")
-        ff = QFormLayout(fg)
-        self.sp_rate = QSpinBox()
-        self.sp_rate.setRange(10, 1000)
-        self.sp_rate.setValue(200)
-        self.sp_rate.setSuffix(" Hz")
-        self.sp_rate.setToolTip("电机已使能时为 MIT 控制帧频率，未使能时为 0xCC 查询帧频率")
-        self.lbl_frame = QLabel("—")
-        self.lbl_rate = QLabel("—")
+    def applied(self) -> dict:
+        return {k: r.applied for k, r in self.rows.items()}
+
+    def apply(self):
+        for r in self.rows.values():
+            r.mark_applied()
+        self._show()
+        self.on_apply(self.applied())
+
+    def reset_zero(self):
+        for r in self.rows.values():
+            r.set_value(0.0)
+            r.mark_applied()
+        self._show()
+
+    def _edited(self):
+        if not hasattr(self, "btn_apply"):
+            return
+        pend = any(r.pending() for r in self.rows.values())
+        self.btn_apply.setEnabled(pend)
+        self.btn_revert.setEnabled(pend)
+
+    def _show(self):
+        a = self.applied()
+        self.lbl_applied.setText("已应用：" + "  ".join(f"{k}={v:.6g}" for k, v in a.items()))
+        self._edited()
+
+
+class ControlPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.worker = None
+        self.driver = None
+
+        # 电流/扭矩主页
+        self.cur = _Params([("out", "输出", "", 3, 0.05)], self._apply_cur)
+        self.lbl_cur_hint = QLabel()
+        self.lbl_cur_hint.setWordWrap(True)
+        self.lbl_cur_hint.setStyleSheet("color:#795548")
+        pc = QWidget()
+        lc = QVBoxLayout(pc)
+        lc.addWidget(self.cur)
+        lc.addWidget(self.lbl_cur_hint)
+        lc.addStretch(1)
+
+        # MIT 子页
+        self.mit = _Params([("p", "位置 p", "rad", 4, 0.01), ("v", "速度 v", "rad/s", 3, 0.1),
+                            ("kp", "Kp", "", 2, 1.0), ("kd", "Kd", "", 3, 0.05),
+                            ("t", "前馈扭矩 t", "Nm", 3, 0.1)], self._apply_mit)
         self.lbl_lim = QLabel("—")
         self.lbl_lim.setWordWrap(True)
-        ff.addRow("通信频率（MIT/查询）", self.sp_rate)
-        ff.addRow("当前发送", self.lbl_frame)
-        ff.addRow("实际发送频率", self.lbl_rate)
-        ff.addRow("当前量程", self.lbl_lim)
+        pm = QWidget()
+        lm = QVBoxLayout(pm)
+        lm.addWidget(self.mit)
+        f = QFormLayout()
+        f.addRow("当前量程", self.lbl_lim)
+        lm.addLayout(f)
+        tip = QLabel("MIT 模式下，前馈扭矩 t 同样受左侧「电流/扭矩限幅」限制；位置/速度环由驱动器完成。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:gray")
+        lm.addWidget(tip)
+        lm.addStretch(1)
 
-        # 读数
+        self.tabs = QTabWidget()
+        self.tabs.addTab(pc, "电流 / 扭矩")
+        self.tabs.addTab(pm, "MIT")
+        self.tabs.currentChanged.connect(self._tab_changed)
+
         rg = QGroupBox("实时反馈")
         rf = QFormLayout(rg)
         mono = "font-family:Consolas,monospace;font-size:13px"
         self.lbl = {}
-        for k, name in (("pos", "位置"), ("vel", "速度"), ("tq", "扭矩"), ("tmp", "温度 d6/d7"),
-                        ("err", "状态码"), ("raw", "原始字节")):
+        for k, name in (("pos", "位置（原始 / 累计）"), ("vel", "速度"), ("out", "输出（指令 / 反馈）"),
+                        ("tmp", "温度"), ("code", "状态码"), ("raw", "原始字节")):
             lb = QLabel("—")
             lb.setStyleSheet(mono)
             lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -189,132 +212,85 @@ class ControlPanel(QGroupBox):
             rf.addRow(name, lb)
 
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(pg)
+        lay.addWidget(self.tabs)
         lay.addWidget(rg)
-        lay.addWidget(fg)
         lay.addStretch(1)
-
-        self.set_limits(P.DEFAULT_LIMITS, False)
-        self.btn_enable.clicked.connect(lambda: self.worker and self.worker.enable())
-        self.btn_disable.clicked.connect(lambda: self.worker and self.worker.disable())
-        self.btn_clear.clicked.connect(lambda: self.worker and self.worker.clear_error())
-        self.btn_zero.clicked.connect(lambda: self.worker and self.worker.set_zero())
-        self.btn_apply.clicked.connect(self.apply)
-        self.btn_revert.clicked.connect(self._revert)
-        self.btn_all0.clicked.connect(lambda: [r.set_value(0.0) for r in self.rows.values()])
-        self.sp_rate.valueChanged.connect(self._rates)
-        self._show_applied()
         self.set_bound(None)
 
-    # ---------- 外部接口 ----------
+    # ---------- 外部 ----------
     def set_bound(self, worker):
         self.worker = worker
-        on = worker is not None
-        for w in (self.btn_enable, self.btn_disable, self.btn_clear, self.btn_zero):
-            w.setEnabled(on)
-        if on:
-            self._rates()
-            # 连接后将已应用的参数同步给 worker
-            worker.set_target(self.applied_command())
-        else:
+        self.set_driver(None)
+
+    def set_driver(self, d):
+        self.driver = d
+        self.cur.reset_zero()
+        self.mit.reset_zero()
+        has_mit = d is not None and d.caps.mit
+        self.tabs.setTabEnabled(1, has_mit)
+        self.tabs.setTabToolTip(1, "" if has_mit else "当前电机不支持 MIT 协议")
+        if not has_mit:
+            self.tabs.setCurrentIndex(0)
+        if d is None:
+            self.lbl_cur_hint.setText("")
             for lb in self.lbl.values():
                 lb.setText("—")
-            self.lbl_motor.setText("电机状态：—")
-            self.lbl_motor.setStyleSheet("")
-            self.lbl_frame.setText("—")
-            self.lbl_rate.setText("—")
+            return
+        r = self.cur.rows["out"]
+        r.spin.setSuffix(f" {d.out_unit}")
+        r.set_range(-d.out_max, d.out_max)
+        if d.caps.mit:
+            self.lbl_cur_hint.setText("达妙/HM 的电流模式即 MIT kp=kd=p=v=0、t=输出（Nm）。"
+                                      "空载时超过静摩擦会持续加速。")
+        else:
+            self.lbl_cur_hint.setText(f"大疆电调电流指令，单位 A（厂家比例 ±{d.m.raw_max} ↔ ±{d.out_max:g} A）。")
+        self._tab_changed(self.tabs.currentIndex())
 
     def set_limits(self, lim: P.Limits, from_motor: bool):
-        self.rows["p"].set_range(lim.p_min, lim.p_max)
-        self.rows["v"].set_range(lim.v_min, lim.v_max)
-        self.rows["kp"].set_range(lim.kp_min, lim.kp_max)
-        self.rows["kd"].set_range(lim.kd_min, lim.kd_max)
-        self.rows["t"].set_range(lim.t_min, lim.t_max)
+        r = self.mit.rows
+        r["p"].set_range(lim.p_min, lim.p_max)
+        r["v"].set_range(lim.v_min, lim.v_max)
+        r["kp"].set_range(lim.kp_min, lim.kp_max)
+        r["kd"].set_range(lim.kd_min, lim.kd_max)
+        r["t"].set_range(lim.t_min, lim.t_max)
+        if self.driver is not None and self.driver.caps.mit:
+            self.cur.rows["out"].set_range(lim.t_min, lim.t_max)
         src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
         self.lbl_lim.setText(f"p ±{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
                              f"kp 0~{lim.kp_max:g}  kd 0~{lim.kd_max:g}（{src}）")
         self.lbl_lim.setStyleSheet("" if from_motor else "color:#c62828")
 
-    def command(self) -> P.MitCommand:
-        r = self.rows
-        return P.MitCommand(r["p"].value(), r["v"].value(), r["kp"].value(), r["kd"].value(),
-                            r["t"].value())
-
-    def applied_command(self) -> P.MitCommand:
-        r = self.rows
-        return P.MitCommand(r["p"].applied, r["v"].applied, r["kp"].applied, r["kd"].applied,
-                            r["t"].applied)
-
-    def set_and_apply(self, cmd: P.MitCommand):
-        """由测试页等显式操作调用：写入界面并应用。"""
-        for k in ("p", "v", "kp", "kd", "t"):
-            self.rows[k].set_value(getattr(cmd, k))
-        self.apply()
-
-    def on_status(self, st: P.Status):
-        self.lbl["pos"].setText(f"{st.pos:+9.4f} rad")
-        self.lbl["vel"].setText(f"{st.vel:+9.3f} rad/s")
-        self.lbl["tq"].setText(f"{st.torque:+9.3f} Nm")
-        self.lbl["tmp"].setText(f"{st.t_mos} / {st.t_rotor} ℃")
-        fault = P.is_fault(st.err)
-        self.lbl["err"].setText(f"{st.err}  {P.code_text(st.err)}" + ("  请清错" if fault else ""))
-        self.lbl["err"].setStyleSheet("color:#c62828;font-weight:bold" if fault else "")
-        self.lbl["raw"].setText(P.hexdata(st.raw))
-
-    def on_state(self, s: dict):
-        if self.worker is None:
+    def on_sample(self, s):
+        d = self.driver
+        if d is None:
             return
-        code = s["code"]
-        if code < 0:
-            txt, style = "电机状态：无反馈", "background:#9e9e9e;color:white"
-        elif code == P.CODE_ENABLED:
-            txt, style = "电机状态：已使能", "background:#2e7d32;color:white"
-        elif code == P.CODE_DISABLED:
-            txt, style = "电机状态：失能", "background:#e0e0e0"
+        fb = s.fb
+        self.lbl["pos"].setText(f"{fb.pos:+9.4f} / {s.pos_mt:+10.4f} rad")
+        self.lbl["vel"].setText(f"{fb.vel:+9.3f} rad/s")
+        cmd = "—" if s.out != s.out else f"{s.out:+.3f}"
+        self.lbl["out"].setText(f"{cmd} / {fb.out:+.3f} {d.out_unit}")
+        t2 = "" if fb.temp2 != fb.temp2 else f" / {fb.temp2:.0f}"
+        self.lbl["tmp"].setText("—" if fb.temp != fb.temp else f"{fb.temp:.0f}{t2} ℃")
+        if d.caps.status_code:
+            fault = d.is_fault(fb.code)
+            self.lbl["code"].setText(f"{fb.code}  {d.code_text(fb.code)}")
+            self.lbl["code"].setStyleSheet("color:#c62828;font-weight:bold" if fault else "")
         else:
-            txt, style = f"电机状态：{P.code_text(code)}", "background:#c62828;color:white"
-        self.lbl_motor.setText(txt)
-        self.lbl_motor.setStyleSheet(style + ";font-weight:bold;border-radius:3px")
-        self.btn_enable.setEnabled(not s.get("scanning") and s["limits_ok"])
-        self.btn_zero.setEnabled(not s["blocked"])
-        if s.get("scanning"):
-            self.lbl_frame.setText("扫描中（暂停查询）")
-        elif code == P.CODE_ENABLED:
-            self.lbl_frame.setText("MIT 控制帧")
-        else:
-            self.lbl_frame.setText("0xCC 查询帧")
-        self.lbl_rate.setText(f"{s['tx_rate']:.0f} Hz")
+            self.lbl["code"].setText("（协议无状态码）")
+        self.lbl["raw"].setText(P.hexdata(fb.raw))
 
-    def estop(self):
-        if self.worker:
-            self.worker.estop()
-
-    def apply(self):
-        for r in self.rows.values():
-            r.mark_applied()
-        if self.worker:
-            self.worker.set_target(self.applied_command())
-        self._show_applied()
+    def to_current(self):
+        self.tabs.setCurrentIndex(0)
 
     # ---------- 内部 ----------
-    def _revert(self):
-        for r in self.rows.values():
-            r.set_value(r.applied)
-
-    def _edited(self):
-        if not hasattr(self, "btn_apply"):
-            return
-        pend = any(r.pending() for r in self.rows.values()) if hasattr(self, "rows") and len(self.rows) == 5 else False
-        self.btn_apply.setEnabled(pend)
-        self.btn_revert.setEnabled(pend)
-
-    def _show_applied(self):
-        c = self.applied_command()
-        self.lbl_applied.setText(f"已应用: p={c.p:.4f} v={c.v:.3f} kp={c.kp:g} kd={c.kd:g} t={c.t:.3f}")
-        self._edited()
-
-    def _rates(self):
+    def _apply_cur(self, a: dict):
         if self.worker:
-            self.worker.rate_hz = float(self.sp_rate.value())
-        self.rate_changed.emit(float(self.sp_rate.value()))
+            self.worker.set_target_out(a["out"])
+
+    def _apply_mit(self, a: dict):
+        if self.worker:
+            self.worker.set_target_mit(P.MitCommand(a["p"], a["v"], a["kp"], a["kd"], a["t"]))
+
+    def _tab_changed(self, i: int):
+        if self.worker is not None:
+            self.worker.set_mode("mit" if i == 1 else "current")

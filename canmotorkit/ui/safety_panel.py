@@ -102,6 +102,12 @@ class SafetyPanel(QGroupBox):
             self.lbl_state.setStyleSheet("")
             self.lbl_pos.setText("—")
 
+    def set_unit(self, unit: str):
+        self.sp_out.setSuffix(f" {unit}" if unit else "")
+
+    def set_driver(self, d):
+        self.set_unit(d.out_unit if d else "")
+
     def estop(self):
         if self.worker:
             self.worker.estop()
