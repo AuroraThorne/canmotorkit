@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFormLayo
                                QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
                                QVBoxLayout, QWidget)
 
-from hm.siggen import KINDS, SignalGen, step_metrics
+from canmotorkit.analysis.siggen import KINDS, SignalGen, step_metrics
 
 CHANNELS = {"p": "位置 p (rad)", "v": "速度 v (rad/s)", "t": "扭矩 t (Nm)"}
 REC_COLS = ["t", "p_cmd", "v_cmd", "t_cmd", "kp", "kd", "p_fb", "v_fb", "t_fb", "t_mos", "t_rotor", "err"]

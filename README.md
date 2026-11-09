@@ -1,12 +1,13 @@
-# HM 关节伺服 PCAN 调参工具
+# CanMotorKit
 
-依据《HM系列关节伺服电机使用手册V1.06》编写，适配 PEAK PCAN-USB，已在 HM9816G9 实机验证通信。
+基于 PEAK PCAN 的 CAN 电机调试与测试工具。约定见 `AGENTS.md`，待办见 `TODO.md`，厂家资料见 `reference/`。
+当前已实现达妙/HM（MIT + 0x7FF），在 HM9816G9 实机验证通信；大疆等见 TODO。
 
 ## 安装 / 运行
 ```
 pip install -r requirements.txt
 python main.py          # 真实硬件（需安装 PEAK 驱动，PCANBasic.dll）
-python main.py --sim    # 仿真总线（虚拟电机 ID 1 和 5）
+python main.py --sim    # 演示台（虚拟电机），也可在通道下拉选「演示台」
 python -m pytest tests  # 单元/集成测试
 python tools/hw_diag.py info                    # 实机只读诊断
 python tools/hw_diag.py torque --t 0.3 --dur 1  # 实机纯扭矩测试（|t|<=1Nm，<=5s）
@@ -20,6 +21,11 @@ python tools/hw_diag.py torque --t 0.3 --dur 1  # 实机纯扭矩测试（|t|<=1
 - **目标参数**：默认全 0，修改后（黄色标记）必须点“应用”或在数值框按回车才生效。
 - **量程**：连接后自动读取 p_max/v_max/t_max（0x15~0x17）。未读到时禁止使能，可在参数页“重读量程”。KP 0~500、KD 0~5 固定。
 - **配置帧保护**：电机使能中不发送 0x7FF 配置帧（读请求排队，写/保存/改 ID/设零/扫描拒绝）。
+
+## 安全
+- 左栏「安全限制 / 急停」：速度上限、电流/扭矩限幅、位置窗口（多圈累计）、温度、反馈超时。
+- 急停（按钮 / Esc / 空格）与超限均为**零扭矩并锁存**，不失能；状态栏红色显示原因，
+  点「解除锁存」后恢复发送已应用参数。失能只由用户点「失能」。
 
 ## 状态码（状态帧 d0 高 4 位）
 | 码 | 含义 |

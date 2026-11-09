@@ -20,9 +20,10 @@ from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QThread, Signal
 
-from . import protocol as P
+from ..drivers import dm_protocol as P
 from .bus import BusError, CanBus, Frame
-from .siggen import SignalGen
+from ..analysis.siggen import SignalGen
+from ..control.safety import SafetyLimits, Supervisor
 
 LIMIT_RIDS = (0x15, 0x16, 0x17)
 
@@ -76,6 +77,7 @@ class Worker(QThread):
         self._target = P.MitCommand()
         self._last_cmd = P.MitCommand()
         self._warned_nolim = False
+        self.safety = Supervisor()
         self._ops: queue.Queue = queue.Queue()
         self._reqs: collections.deque[_Req] = collections.deque()
         self._pending: _Req | None = None
@@ -118,8 +120,18 @@ class Worker(QThread):
     def disable(self):
         self._post(self._do_disable)
 
-    def estop(self):
-        self._post(self._do_estop)
+    def estop(self, reason: str = "用户急停"):
+        """急停：零扭矩（kp=kd=t=0）并锁存，不失能。"""
+        self._post(self._do_estop, reason)
+
+    def reset_safety(self):
+        self._post(self._do_reset_safety)
+
+    def set_safety_limits(self, lim: SafetyLimits):
+        self._post(setattr, self.safety, "limits", lim)
+
+    def zero_safety_position(self):
+        self._post(self.safety.zero_position)
 
     def clear_error(self):
         self._post(self._do_clear)
@@ -206,6 +218,7 @@ class Worker(QThread):
                                                   self._lim_vals[0x17])
             was = self.limits_ok
             self.limits_ok = True
+            self.safety.set_wrap_span(2 * self.lim.p_max)
             self.limits_changed.emit(self.lim, True)
             if not was:
                 L = self.lim
@@ -248,12 +261,17 @@ class Worker(QThread):
             self._went_disabled()
         self._msg("已发送失能 FD")
 
-    def _do_estop(self):
+    def _do_estop(self, reason: str):
         self._abort_signal()
+        self.safety.trip(reason)
         self._send(self.motor_id, P.pack_mit(P.MitCommand(), self.lim))
-        if self._send(self.motor_id, P.special_frame(P.SPECIAL_DISABLE)):
-            self._went_disabled()
-        self._msg("急停：已发送零力矩帧 + 失能")
+        self._msg(f"急停（{reason}）：已发送零扭矩帧并锁存，电机仍使能；失能请手动点击")
+
+    def _do_reset_safety(self):
+        if self.safety.reset():
+            self._msg("已解除急停/超限锁存")
+        else:
+            self._msg("不能解除：" + self.safety.reason)
 
     def _do_clear(self):
         self._send(self.motor_id, P.special_frame(P.SPECIAL_CLEAR_ERROR))
@@ -332,6 +350,8 @@ class Worker(QThread):
 
     # ---------- 周期任务 ----------
     def _compute_cmd(self, now: float) -> P.MitCommand:
+        if self.safety.tripped:
+            return P.MitCommand()      # 锁存：只发零扭矩
         cmd = self.get_target()
         if self._sig:
             gen, ch, t0 = self._sig
@@ -341,10 +361,20 @@ class Worker(QThread):
                 cmd = self.get_target()
             else:
                 setattr(cmd, ch, v)
+        cmd.t = self.safety.filter_output(now, cmd.t)
+        if self.safety.tripped:
+            self._on_trip()
+            return P.MitCommand()
         L = self.lim
         return P.MitCommand(P.clamp(cmd.p, L.p_min, L.p_max), P.clamp(cmd.v, L.v_min, L.v_max),
                             P.clamp(cmd.kp, L.kp_min, L.kp_max), P.clamp(cmd.kd, L.kd_min, L.kd_max),
                             P.clamp(cmd.t, L.t_min, L.t_max))
+
+    def _on_trip(self):
+        if not getattr(self, "_trip_reported", False):
+            self._trip_reported = True
+            self._abort_signal()
+            self._msg("安全限制触发零扭矩：" + self.safety.reason)
 
     def _on_rx(self, f: Frame) -> P.Status | None:
         d = f.data
@@ -375,6 +405,11 @@ class Worker(QThread):
         self.motor_code = st.err
         self.last_status = st
         self.last_status_t = f.t
+        self.safety.on_feedback(f.t, st.pos, st.vel, max(st.t_mos, st.t_rotor))
+        if self.safety.tripped and st.err == P.CODE_ENABLED:
+            self._on_trip()
+        elif not self.safety.tripped:
+            self._trip_reported = False
         return st
 
     def _finish_req(self, d: bytes):
@@ -523,6 +558,9 @@ class Worker(QThread):
                         "queue": len(self._reqs) + (1 if self._pending else 0),
                         "limits_ok": self.limits_ok,
                         "blocked": self._config_blocked(),
+                        "tripped": self.safety.tripped,
+                        "trip_reason": self.safety.reason,
+                        "pos_mt": self.safety.pos,
                     })
                 time.sleep(0.0005)
         finally:

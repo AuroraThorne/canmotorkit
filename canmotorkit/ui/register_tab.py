@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QHea
                                QInputDialog, QLabel, QMessageBox, QPushButton, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from hm import protocol as P
+from canmotorkit.drivers import dm_protocol as P
 
 C_RID, C_NAME, C_TYPE, C_VAL, C_NEW, C_DESC = range(6)
 TYPE_TXT = {"f": "float", "u": "uint32", "i": "int32"}

@@ -15,8 +15,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from hm import protocol as P  # noqa: E402
-from hm.pcan_basic import BAUDRATES, PCAN_ERROR_QRCVEMPTY, PCANBasic, USB_CHANNELS  # noqa: E402
+from canmotorkit.drivers import dm_protocol as P  # noqa: E402
+from canmotorkit.core.pcan_basic import BAUDRATES, PCAN_ERROR_QRCVEMPTY, PCANBasic, USB_CHANNELS  # noqa: E402
 
 T_LIMIT = 1.0
 DUR_LIMIT = 5.0

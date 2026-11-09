@@ -8,7 +8,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from . import protocol as P
+from ..drivers import dm_protocol as P
 
 
 @dataclass

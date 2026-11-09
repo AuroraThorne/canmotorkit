@@ -19,7 +19,7 @@ def main():
     import pyqtgraph as pg
     from PySide6.QtWidgets import QApplication
 
-    from ui.main_window import MainWindow
+    from canmotorkit.ui.main_window import MainWindow
 
     pg.setConfigOptions(antialias=False, foreground="k")
     app = QApplication(sys.argv)

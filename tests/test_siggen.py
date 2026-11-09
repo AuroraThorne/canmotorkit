@@ -1,4 +1,4 @@
-from hm.siggen import SignalGen, step_metrics
+from canmotorkit.analysis.siggen import SignalGen, step_metrics
 
 
 def test_step_metrics_ignores_small_pre_adjust():

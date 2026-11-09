@@ -4,10 +4,10 @@ import time
 import pytest
 from PySide6.QtCore import QCoreApplication
 
-from hm import protocol as P
-from hm.bus import SimBus
-from hm.siggen import SignalGen, step_metrics
-from hm.worker import Worker
+from canmotorkit.drivers import dm_protocol as P
+from canmotorkit.core.bus import SimBus
+from canmotorkit.analysis.siggen import SignalGen, step_metrics
+from canmotorkit.core.worker import Worker
 
 
 @pytest.fixture(scope="module")
@@ -142,8 +142,29 @@ def test_step_and_estop(app, rig):
     m = step_metrics([x.t for x in s], [x.cmd.p for x in s], [x.st.pos for x in s])
     assert m is not None and abs(m.ss_error) < 0.02, m
     w.estop()
+    pump(app, 0.3)
+    m0 = bus.motors[0]
+    assert m0.enabled and w.safety.tripped                     # 急停不失能
+    assert m0.cmd.kp == 0 and m0.cmd.kd == 0 and abs(m0.cmd.t) < 0.05
+    w.set_target(P.MitCommand(t=0.5))
+    pump(app, 0.2)
+    assert abs(m0.cmd.t) < 0.05                                # 锁存中仍为 0
+    w.disable()
     assert pump(app, 0.5, lambda: w.motor_code == 0)
-    assert not bus.motors[0].enabled
+
+
+def test_overspeed_trips_zero_torque(app, rig):
+    from canmotorkit.control.safety import SafetyLimits
+    w, bus, rec = rig
+    assert pump(app, 1.0, lambda: w.limits_ok)
+    w.set_safety_limits(SafetyLimits(vel_max=3.0, out_max=5.0, temp_max=0))
+    w.set_target(P.MitCommand(t=2.0))
+    w.enable()
+    assert pump(app, 3.0, lambda: w.safety.tripped)
+    assert "速度" in w.safety.reason
+    pump(app, 0.1)
+    assert abs(bus.motors[0].cmd.t) < 0.05 and bus.motors[0].enabled
+    w.disable()
 
 
 def test_no_limits_refuses_enable(app):

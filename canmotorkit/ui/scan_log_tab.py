@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, Q
                                QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from hm import protocol as P
+from canmotorkit.drivers import dm_protocol as P
 
 
 class ScanLogTab(QWidget):

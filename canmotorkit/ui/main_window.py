@@ -7,14 +7,15 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QLabel, QLineEdit
                                QMessageBox, QPlainTextEdit, QScrollArea, QSplitter, QTabWidget,
                                QTableWidget, QVBoxLayout, QWidget)
 
-from hm import protocol as P
-from hm.bus import BusError, PcanBus, SimBus
-from hm.worker import Worker
+from canmotorkit.drivers import dm_protocol as P
+from canmotorkit.core.bus import BusError, PcanBus, SimBus
+from canmotorkit.core.worker import Worker
 
 from .connection_panel import ConnectionPanel
 from .control_tab import ControlPanel
 from .plot_widget import PlotWidget
 from .register_tab import RegisterTab
+from .safety_panel import SafetyPanel
 from .scan_log_tab import ScanLogTab
 from .test_tab import TestTab
 
@@ -40,17 +41,19 @@ class _SpaceEstop(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HM 关节伺服调参工具 (PCAN)")
+        self.setWindowTitle("CanMotorKit")
         self.resize(1400, 860)
         self.bus = None
         self.worker: Worker | None = None
 
         self.conn = ConnectionPanel()
         self.control = ControlPanel()
+        self.safety = SafetyPanel()
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
         ll.addWidget(self.conn)
+        ll.addWidget(self.safety)
         ll.addWidget(self.control)
         scroll = QScrollArea()
         scroll.setWidget(left)
@@ -92,9 +95,9 @@ class MainWindow(QMainWindow):
         self.regs.ids_changed.connect(self.conn.set_ids)
         self.scan.use_motor.connect(self._use_motor)
 
-        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.control.estop,
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.safety.estop,
                   context=Qt.ApplicationShortcut)
-        self._space = _SpaceEstop(self.control.estop)
+        self._space = _SpaceEstop(self.safety.estop)
         QApplication.instance().installEventFilter(self._space)
 
         if self.conn.pcan_error:
@@ -122,7 +125,7 @@ class MainWindow(QMainWindow):
         w.signal_finished.connect(self.test.on_finished)
         self.worker = w
         self.control.set_limits(P.DEFAULT_LIMITS, False)
-        for panel in (self.control, self.regs, self.test, self.scan):
+        for panel in (self.control, self.safety, self.regs, self.test, self.scan):
             panel.set_bound(w)
         self.conn.set_connected(True)
         self.plot.clear()
@@ -144,7 +147,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.bus = None
-        for panel in (self.control, self.regs, self.test, self.scan):
+        for panel in (self.control, self.safety, self.regs, self.test, self.scan):
             panel.set_bound(None)
         self.conn.set_connected(False)
         self.st_conn.setText("未连接")
@@ -163,6 +166,7 @@ class MainWindow(QMainWindow):
         self.control.on_status(samples[-1].st)
 
     def _on_state(self, s: dict):
+        self.safety.on_state(s)
         self.control.on_state(s)
         self.regs.on_state(s)
         self.scan.on_state(s)

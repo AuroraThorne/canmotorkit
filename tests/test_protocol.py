@@ -3,7 +3,7 @@ import struct
 
 import pytest
 
-from hm import protocol as P
+from canmotorkit.drivers import dm_protocol as P
 
 G9 = P.DEFAULT_LIMITS
 

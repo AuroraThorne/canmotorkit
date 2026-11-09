@@ -5,9 +5,9 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
                                QPushButton, QSpinBox, QWidget)
 
-from hm.pcan_basic import BAUDRATES, USB_CHANNELS
+from canmotorkit.core.pcan_basic import BAUDRATES, USB_CHANNELS
 
-SIM_LABEL = "仿真总线 (无硬件)"
+SIM_LABEL = "演示台（虚拟电机，无需硬件）"
 
 
 class ConnectionPanel(QGroupBox):
@@ -59,7 +59,7 @@ class ConnectionPanel(QGroupBox):
         self.cb_channel.clear()
         attached = []
         try:
-            from hm.pcan_basic import PCANBasic
+            from canmotorkit.core.pcan_basic import PCANBasic
             attached = PCANBasic().attached_channels()
             self.pcan_error = ""
         except Exception as e:

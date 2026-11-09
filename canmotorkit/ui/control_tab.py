@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QPushButton, QSlider, QSpinBox, QToolButton, QVBoxLayout)
 
-from hm import protocol as P
+from canmotorkit.drivers import dm_protocol as P
 
 PENDING_STYLE = "QDoubleSpinBox{background:#fff3c4}"
 
@@ -55,7 +55,7 @@ class _Row:
         self.spin.blockSignals(True)
         self.spin.setRange(lo, hi)
         self.spin.blockSignals(False)
-        self.range_lbl.setText(f"[{lo:.4g}, {hi:.4g}]")
+        self.range_lbl.setText(f"[{lo:.7g}, {hi:.7g}]")
         self.set_value(v)
 
     def value(self) -> float:
@@ -117,8 +117,6 @@ class ControlPanel(QGroupBox):
 
         self.btn_enable = btn("使能 (FC)")
         self.btn_disable = btn("失能 (FD)")
-        self.btn_estop = btn("急停  [Esc / 空格]", "QPushButton{background:#c62828;color:white;"
-                                                   "font-weight:bold;font-size:15px}", h=40)
         self.btn_clear = btn("清错 (FB)")
         self.btn_zero = btn("设零点 (FE)")
         self.btn_zero.setToolTip("将当前输出轴位置设为零点（需失能）")
@@ -132,7 +130,6 @@ class ControlPanel(QGroupBox):
         top.addWidget(self.btn_disable, 1, 1)
         top.addWidget(self.btn_clear, 2, 0)
         top.addWidget(self.btn_zero, 2, 1)
-        top.addWidget(self.btn_estop, 3, 0, 1, 2)
 
         # 参数
         pg = QGroupBox("目标参数（修改后点“应用”或按回车生效）")
@@ -201,7 +198,6 @@ class ControlPanel(QGroupBox):
         self.set_limits(P.DEFAULT_LIMITS, False)
         self.btn_enable.clicked.connect(lambda: self.worker and self.worker.enable())
         self.btn_disable.clicked.connect(lambda: self.worker and self.worker.disable())
-        self.btn_estop.clicked.connect(self.estop)
         self.btn_clear.clicked.connect(lambda: self.worker and self.worker.clear_error())
         self.btn_zero.clicked.connect(lambda: self.worker and self.worker.set_zero())
         self.btn_apply.clicked.connect(self.apply)
@@ -215,7 +211,7 @@ class ControlPanel(QGroupBox):
     def set_bound(self, worker):
         self.worker = worker
         on = worker is not None
-        for w in (self.btn_enable, self.btn_disable, self.btn_estop, self.btn_clear, self.btn_zero):
+        for w in (self.btn_enable, self.btn_disable, self.btn_clear, self.btn_zero):
             w.setEnabled(on)
         if on:
             self._rates()
@@ -236,7 +232,7 @@ class ControlPanel(QGroupBox):
         self.rows["kd"].set_range(lim.kd_min, lim.kd_max)
         self.rows["t"].set_range(lim.t_min, lim.t_max)
         src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
-        self.lbl_lim.setText(f"p ±{lim.p_max:.4g}  v ±{lim.v_max:.4g}  t ±{lim.t_max:.4g}\n"
+        self.lbl_lim.setText(f"p ±{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
                              f"kp 0~{lim.kp_max:g}  kd 0~{lim.kd_max:g}（{src}）")
         self.lbl_lim.setStyleSheet("" if from_motor else "color:#c62828")
 
