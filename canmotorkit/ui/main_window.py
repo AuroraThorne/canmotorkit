@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(left)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(470)
+        scroll.setMinimumWidth(200)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.card = MotorCard()
