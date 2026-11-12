@@ -4,8 +4,8 @@ from __future__ import annotations
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QLabel, QLineEdit, QMainWindow,
-                               QMessageBox, QPlainTextEdit, QScrollArea, QSplitter, QTabWidget,
-                               QTableWidget, QVBoxLayout, QWidget)
+                               QMessageBox, QPlainTextEdit, QScrollArea, QSizePolicy, QSplitter,
+                               QTabWidget, QTableWidget, QVBoxLayout, QWidget)
 
 from canmotorkit import APP_NAME
 from canmotorkit.core.bus import PcanBus
@@ -97,9 +97,16 @@ class MainWindow(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.addWidget(self.card)
         rl.addWidget(self.tabs, 1)
+        # 允许右栏压缩到可用的工作宽度，但禁止被外层 splitter 折叠。
+        right.setMinimumWidth(700)
+        right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         sp = QSplitter(Qt.Horizontal)
         sp.addWidget(scroll)
         sp.addWidget(right)
+        sp.setOpaqueResize(True)
+        sp.setChildrenCollapsible(False)
+        sp.setCollapsible(0, False)
+        sp.setCollapsible(1, False)
         sp.setStretchFactor(1, 1)
         sp.setSizes([480, 1020])
         self.setCentralWidget(sp)
