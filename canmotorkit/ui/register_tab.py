@@ -8,11 +8,13 @@ import json
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMessageBox,
                                QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from canmotorkit.drivers import dm_protocol as P
+
+from .widgets import CheckBox
 
 C_RID, C_NAME, C_SRC, C_TYPE, C_VAL, C_NEW, C_RESP, C_DESC = range(8)
 HEAD = ["RID", "名称", "来源", "类型", "当前值", "新值（双击编辑）", "实测", "说明"]
@@ -75,7 +77,7 @@ class RegisterTab(QWidget):
                     it.setBackground(QBrush(SRC_COLOR[r.src]))
                 self.table.setItem(i, c, it)
 
-        self.chk_family = QCheckBox("只显示当前型号家族的寄存器")
+        self.chk_family = CheckBox("只显示当前型号家族的寄存器")
         self.btn_read_all = QPushButton("全部读取")
         self.btn_read_all.setToolTip("读取表中所有可见寄存器；无应答的在「实测」列标为无应答")
         self.btn_read_sel = QPushButton("读取选中")
@@ -96,9 +98,9 @@ class RegisterTab(QWidget):
         note = QLabel("写入立即生效但不存储（达妙文档），需「保存到 Flash」才掉电保持；HM 是否一致待实测。"
                       "控制模式、波特率、标定值等在本软件中只读。蓝色=仅达妙，紫色=仅 HM。")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#795548")
+        note.setStyleSheet("color:#d6b06a")
         self.lbl = QLabel()
-        self.lbl.setStyleSheet("color:gray")
+        self.lbl.setStyleSheet("color:#aaaaaa")
         self.reg_box = QWidget()
         rl = QVBoxLayout(self.reg_box)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -107,7 +109,7 @@ class RegisterTab(QWidget):
         rl.addWidget(self.table, 1)
         rl.addWidget(self.lbl)
         self.lbl_noreg = QLabel("当前协议不支持参数读写（大疆电调的参数需使用 RoboMaster Assistant）。")
-        self.lbl_noreg.setStyleSheet("color:gray;padding:20px")
+        self.lbl_noreg.setStyleSheet("color:#aaaaaa;padding:20px")
 
         lay = QVBoxLayout(self)
         lay.addWidget(cg)

@@ -1,10 +1,11 @@
-"""① PCAN 连接：通道（含「演示台」）/ 波特率 / 连接。"""
+"""① CAN 连接：PCAN / SocketCAN 通道（含「演示台」）/ 波特率 / 连接。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QPushButton, QWidget
 
 from canmotorkit.core.pcan_basic import BAUDRATES, USB_CHANNELS
+from canmotorkit.core.socketcan import socketcan_interfaces
 
 SIM_LABEL = "演示台（虚拟电机，无需硬件）"
 
@@ -14,7 +15,7 @@ class ConnectionPanel(QGroupBox):
     disconnect_requested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("① PCAN 连接", parent)
+        super().__init__("① CAN 连接", parent)
         self.pcan_error = ""
         self.cb_channel = QComboBox()
         self.cb_channel.setToolTip("「演示台」包含 HM9816G9、达妙 J8009P、大疆 M3508/M2006/GM6020 虚拟电机")
@@ -26,7 +27,7 @@ class ConnectionPanel(QGroupBox):
         h.addWidget(self.btn_refresh)
         self.cb_baud = QComboBox()
         self.cb_baud.addItems(list(BAUDRATES))
-        self.cb_baud.setToolTip("达妙/HM/大疆经典 CAN 均为 1 Mbps")
+        self.cb_baud.setToolTip("PCAN 由本程序设置；SocketCAN 由 Linux ip link 设置")
         self.btn_connect = QPushButton("连接")
         self.btn_connect.setMinimumHeight(30)
         f = QFormLayout(self)
@@ -36,6 +37,7 @@ class ConnectionPanel(QGroupBox):
         self._connected = False
         self.btn_refresh.clicked.connect(self.refresh_channels)
         self.btn_connect.clicked.connect(self._on_click)
+        self.cb_channel.currentIndexChanged.connect(self._channel_changed)
         self.refresh_channels()
 
     def refresh_channels(self):
@@ -53,15 +55,30 @@ class ConnectionPanel(QGroupBox):
             for i in range(1, 5):
                 name = f"PCAN_USBBUS{i}"
                 self.cb_channel.addItem(f"{name} (未检测到)", ("pcan", USB_CHANNELS[name]))
+        for name in socketcan_interfaces():
+            self.cb_channel.addItem(f"SocketCAN {name}（波特率由系统配置）", ("socketcan", name))
         self.cb_channel.addItem(SIM_LABEL, ("sim", 0))
+        if not attached:
+            self.select_sim()
+        self._channel_changed()
 
     def select_sim(self):
         self.cb_channel.setCurrentIndex(self.cb_channel.count() - 1)
 
     def params(self) -> dict:
         kind, handle = self.cb_channel.currentData()
-        return {"sim": kind == "sim", "channel": handle, "channel_name": self.cb_channel.currentText(),
+        return {"kind": kind, "sim": kind == "sim", "channel": handle,
+                "channel_name": self.cb_channel.currentText(),
                 "baud": BAUDRATES[self.cb_baud.currentText()]}
+
+    def _channel_changed(self):
+        data = self.cb_channel.currentData()
+        is_socketcan = bool(data and data[0] == "socketcan")
+        self.cb_baud.setEnabled(not is_socketcan)
+        if is_socketcan:
+            self.cb_baud.setToolTip("SocketCAN 波特率由 Linux 配置，例如 can0 使用 ip link set can0 ...")
+        else:
+            self.cb_baud.setToolTip("PCAN 由本程序设置；达妙/HM/大疆经典 CAN 通常为 1 Mbps")
 
     def _on_click(self):
         if self._connected:

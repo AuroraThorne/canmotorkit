@@ -1,6 +1,6 @@
 # CanMotorKit
 
-基于 PEAK PCAN 的 CAN 电机调试与测试工具。约定见 `AGENTS.md`，待办见 `TODO.md`，厂家资料见 `reference/`。
+基于 PEAK PCAN / Linux SocketCAN 的 CAN 电机调试与测试工具。约定见 `AGENTS.md`，待办见 `TODO.md`，厂家资料见 `reference/`。
 当前已实现达妙/HM（MIT + 0x7FF），在 HM9816G9 实机验证通信；大疆等见 TODO。
 
 ## 安装 / 运行
@@ -12,6 +12,14 @@ python -m pytest tests  # 单元/集成测试
 python tools/hw_diag.py info                    # 实机只读诊断
 python tools/hw_diag.py torque --t 0.3 --dur 1  # 实机纯扭矩测试（|t|<=1Nm，<=5s）
 ```
+
+Linux 使用 SocketCAN 时，先由系统配置并启用接口，例如：
+```
+sudo ip link set can0 down 2>/dev/null || true
+sudo ip link set can0 up type can bitrate 1000000
+python main.py
+```
+程序会在连接列表中显示 `SocketCAN can0`。SocketCAN 的波特率由 Linux 配置，程序只负责收发经典 CAN 帧。
 
 ## 操作模型
 - **使能 / 失能**：只发 FC / FD，按钮不锁定。电机是否使能以状态帧状态码为准。

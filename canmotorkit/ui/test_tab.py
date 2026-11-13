@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFormLayo
 from canmotorkit.analysis import sysid
 from canmotorkit.analysis.runs import EXCITE_KINDS, ExciteConfig, ExciteRun
 
+from .widgets import CheckBox
+
 
 def dspin(lo, hi, val, dec=3, step=0.1, suffix=""):
     s = QDoubleSpinBox()
@@ -60,7 +62,7 @@ class TestTab(QWidget):
         self.sp_bkp.setToolTip("偏置速度环增益（输出单位 / (rad/s)），应远小于正常速度环")
         self.lbl_est = QLabel()
         self.lbl_est.setWordWrap(True)
-        self.lbl_est.setStyleSheet("color:#795548")
+        self.lbl_est.setStyleSheet("color:#d6b06a")
 
         g = QGroupBox("激励（只发送电流/扭矩）")
         f = QFormLayout(g)
@@ -90,7 +92,7 @@ class TestTab(QWidget):
         note = QLabel("前提：电机已使能、没有安全锁存。全程受左侧「安全限制」保护，超限即零电流并中止。\n"
                       "电流→位置在低频位移很大，建议开启位置窗口。")
         note.setWordWrap(True)
-        note.setStyleSheet("color:gray")
+        note.setStyleSheet("color:#aaaaaa")
         left = QVBoxLayout()
         left.addWidget(g)
         left.addLayout(b)

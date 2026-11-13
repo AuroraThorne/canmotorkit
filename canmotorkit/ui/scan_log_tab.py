@@ -5,11 +5,13 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout,
                                QWidget)
 
 from canmotorkit.drivers import dm_protocol as P
+
+from .widgets import CheckBox
 
 
 class ScanLogTab(QWidget):
@@ -20,11 +22,11 @@ class ScanLogTab(QWidget):
         self.t0: float | None = None
 
         lg = QGroupBox("报文日志")
-        self.chk_log = QCheckBox("记录")
+        self.chk_log = CheckBox("记录")
         self.chk_log.setChecked(True)
-        self.chk_pause = QCheckBox("暂停显示")
-        self.chk_hide = QCheckBox("隐藏周期帧（控制/反馈/查询）")
-        self.chk_mine = QCheckBox("只显示当前电机")
+        self.chk_pause = CheckBox("暂停显示")
+        self.chk_hide = CheckBox("隐藏周期帧（控制/反馈/查询）")
+        self.chk_mine = CheckBox("只显示当前电机")
         self.ed_filter = QLineEdit()
         self.ed_filter.setPlaceholderText("过滤 ID（十六进制，逗号分隔，如 7FF,0,201）")
         self.btn_clear = QPushButton("清空")

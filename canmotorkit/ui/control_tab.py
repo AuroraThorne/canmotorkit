@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QGridLayout, QGroupB
 
 from canmotorkit.drivers import dm_protocol as P
 
-PENDING_STYLE = "QDoubleSpinBox{background:#fff3c4}"
+PENDING_STYLE = "QDoubleSpinBox{background:#d6a936;color:#171717}"
 
 
 class _Row:
@@ -36,7 +36,7 @@ class _Row:
         self.btn0.setText("0")
         self.btn0.setFocusPolicy(Qt.NoFocus)
         self.range_lbl = QLabel()
-        self.range_lbl.setStyleSheet("color:gray")
+        self.range_lbl.setStyleSheet("color:#aaaaaa")
         grid.addWidget(QLabel(label), row, 0)
         grid.addWidget(self.slider, row, 1)
         grid.addWidget(self.spin, row, 2)
@@ -111,7 +111,7 @@ class _Params(QWidget):
             self.rows[k] = _Row(grid, i, label, unit, dec, step, self._edited, self.apply)
         n = len(specs)
         self.btn_apply = QPushButton("应用（回车）")
-        self.btn_apply.setStyleSheet("QPushButton:enabled{font-weight:bold;background:#fff3c4}")
+        self.btn_apply.setStyleSheet("QPushButton:enabled{font-weight:bold;background:#d6a936;color:#171717}")
         self.btn_revert = QPushButton("撤销修改")
         self.btn_all0 = QPushButton("全部置 0")
         self.btn_all0.setToolTip("只修改界面值，仍需应用")
@@ -124,7 +124,7 @@ class _Params(QWidget):
         r.addWidget(self.btn_all0)
         grid.addLayout(r, n, 0, 1, 5)
         self.lbl_applied = QLabel()
-        self.lbl_applied.setStyleSheet("color:gray;font-family:Consolas,monospace")
+        self.lbl_applied.setStyleSheet("color:#aaaaaa;font-family:Consolas,monospace")
         grid.addWidget(self.lbl_applied, n + 1, 0, 1, 5)
         self.btn_apply.clicked.connect(self.apply)
         self.btn_revert.clicked.connect(lambda: [x.set_value(x.applied) for x in self.rows.values()])
@@ -164,12 +164,13 @@ class ControlPanel(QWidget):
         super().__init__(parent)
         self.worker = None
         self.driver = None
+        self._safety_out_max = None
 
         # 电流/扭矩主页
         self.cur = _Params([("out", "输出", "", 3, 0.05)], self._apply_cur)
         self.lbl_cur_hint = QLabel()
         self.lbl_cur_hint.setWordWrap(True)
-        self.lbl_cur_hint.setStyleSheet("color:#795548")
+        self.lbl_cur_hint.setStyleSheet("color:#d6b06a")
         pc = QWidget()
         lc = QVBoxLayout(pc)
         lc.addWidget(self.cur)
@@ -190,7 +191,7 @@ class ControlPanel(QWidget):
         lm.addLayout(f)
         tip = QLabel("MIT 模式下，前馈扭矩 t 同样受左侧「电流/扭矩限幅」限制；位置/速度环由驱动器完成。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:gray")
+        tip.setStyleSheet("color:#aaaaaa")
         lm.addWidget(tip)
         lm.addStretch(1)
 
@@ -224,6 +225,7 @@ class ControlPanel(QWidget):
 
     def set_driver(self, d):
         self.driver = d
+        self._safety_out_max = None
         self.cur.reset_zero()
         self.mit.reset_zero()
         has_mit = d is not None and d.caps.mit
@@ -238,7 +240,7 @@ class ControlPanel(QWidget):
             return
         r = self.cur.rows["out"]
         r.spin.setSuffix(f" {d.out_unit}")
-        r.set_range(-d.out_max, d.out_max)
+        self._update_output_range()
         if d.caps.mit:
             self.lbl_cur_hint.setText("达妙/HM 的电流模式即 MIT kp=kd=p=v=0、t=输出（Nm）。"
                                       "空载时超过静摩擦会持续加速。")
@@ -254,11 +256,26 @@ class ControlPanel(QWidget):
         r["kd"].set_range(lim.kd_min, lim.kd_max)
         r["t"].set_range(lim.t_min, lim.t_max)
         if self.driver is not None and self.driver.caps.mit:
-            self.cur.rows["out"].set_range(lim.t_min, lim.t_max)
+            self._update_output_range()
         src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
         self.lbl_lim.setText(f"p ±{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
                              f"kp 0~{lim.kp_max:g}  kd 0~{lim.kd_max:g}（{src}）")
         self.lbl_lim.setStyleSheet("" if from_motor else "color:#c62828")
+
+    def set_output_limit(self, limit: float | None):
+        """同步左侧安全限幅，控制滑条只能在当前允许范围内调整。"""
+        value = None if limit is None or limit <= 0 else float(limit)
+        if self._safety_out_max == value:
+            return
+        self._safety_out_max = value
+        self._update_output_range()
+
+    def _update_output_range(self):
+        if self.driver is None:
+            return
+        protocol_limit = max(0.0, float(self.driver.out_max))
+        limit = protocol_limit if self._safety_out_max is None else min(protocol_limit, self._safety_out_max)
+        self.cur.rows["out"].set_range(-limit, limit)
 
     def on_sample(self, s):
         d = self.driver

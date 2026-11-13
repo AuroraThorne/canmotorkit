@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
                                QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout,
                                QWidget)
 
@@ -12,6 +12,7 @@ from canmotorkit.analysis import sysid
 from canmotorkit.analysis.runs import LOOP_KINDS, REF_KINDS, LoopConfig, LoopRun
 
 from .test_tab import dspin
+from .widgets import CheckBox
 
 
 class LoopTab(QWidget):
@@ -37,11 +38,11 @@ class LoopTab(QWidget):
         self.sp_dur = dspin(0.2, 60, 2.0, 2, 0.5, " s")
         self.sp_omax = dspin(0, 1000, 1.0, 3, 0.1)
         self.sp_omax.setToolTip("控制器输出限幅；另受左侧安全限幅约束，取二者较小值")
-        self.chk_rel = QCheckBox("位置参考相对起始位置")
+        self.chk_rel = CheckBox("位置参考相对起始位置")
         self.chk_rel.setChecked(True)
         self.lbl_sugg = QLabel("尚无响应测试建议")
         self.lbl_sugg.setWordWrap(True)
-        self.lbl_sugg.setStyleSheet("color:#555")
+        self.lbl_sugg.setStyleSheet("color:#b8b8b8")
         self.btn_fill = QPushButton("填入建议值 × 50%")
         self.btn_fill.setEnabled(False)
 
@@ -75,7 +76,7 @@ class LoopTab(QWidget):
         note = QLabel("上位机闭环经 USB-CAN，延迟约数毫秒，只用于测试与辨识，不作为产品控制器。"
                       "速度/位置/电流超左侧安全限制时立即零电流并中止。建议发送频率 ≥ 500 Hz。")
         note.setWordWrap(True)
-        note.setStyleSheet("color:gray")
+        note.setStyleSheet("color:#aaaaaa")
         left = QVBoxLayout()
         for w in (g, g2, g3):
             left.addWidget(w)

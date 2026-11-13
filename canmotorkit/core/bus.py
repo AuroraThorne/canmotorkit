@@ -1,4 +1,4 @@
-"""CAN 总线抽象：PcanBus（真实硬件）与 SimBus（虚拟 HM 电机，用于无硬件调试）。"""
+"""CAN 总线抽象：PcanBus（Windows）、SocketCanBus（Linux）与 SimBus。"""
 from __future__ import annotations
 
 import time

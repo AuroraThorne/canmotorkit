@@ -10,8 +10,10 @@ import math
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-                               QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
+                               QMessageBox, QPushButton, QVBoxLayout, QWidget)
+
+from .widgets import CheckBox
 
 COLS = ["t", "pos_raw", "pos_mt", "vel", "out_cmd", "out_fb", "ref", "temp", "temp2", "code", "active"]
 IDX = {c: i for i, c in enumerate(COLS)}
@@ -59,13 +61,13 @@ class PlotWidget(QWidget):
         self.sp_win.setSuffix(" s")
         self.cb_pos = QComboBox()
         self.cb_pos.addItems(["位置：多圈累计", "位置：电机原始值"])
-        self.chk_pause = QCheckBox("暂停")
-        self.chk_ref = QCheckBox("显示测试参考")
+        self.chk_pause = CheckBox("暂停")
+        self.chk_ref = CheckBox("显示测试参考")
         self.chk_ref.setChecked(True)
         self.btn_clear = QPushButton("清空")
         self.btn_csv = QPushButton("导出 CSV")
         self.lbl_info = QLabel()
-        self.lbl_info.setStyleSheet("color:gray")
+        self.lbl_info.setStyleSheet("color:#aaaaaa")
         bar = QHBoxLayout()
         for w in (QLabel("窗口"), self.sp_win, self.cb_pos, self.chk_pause, self.chk_ref,
                   self.btn_clear, self.btn_csv):
@@ -108,7 +110,7 @@ class PlotWidget(QWidget):
         self.btn_clear.clicked.connect(self.clear)
         self.btn_csv.clicked.connect(self.export_csv)
         for w in (self.chk_ref, self.cb_pos, self.sp_win):
-            sig = w.toggled if isinstance(w, QCheckBox) else (
+            sig = w.toggled if isinstance(w, CheckBox) else (
                 w.currentIndexChanged if isinstance(w, QComboBox) else w.valueChanged)
             sig.connect(lambda *_: self._mark())
         self.timer = QTimer(self)

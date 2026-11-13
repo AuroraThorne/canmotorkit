@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QLabel, QLineEdit
 from canmotorkit import APP_NAME
 from canmotorkit.core.bus import PcanBus
 from canmotorkit.core.worker import Worker
+from canmotorkit.core.socketcan import SocketCanBus
 from canmotorkit.sim.demo import DemoBus
 
 from .connection_panel import ConnectionPanel
@@ -24,6 +25,127 @@ from .scan_log_tab import ScanLogTab
 from .test_tab import TestTab
 
 TEXT_INPUTS = (QLineEdit, QAbstractSpinBox, QPlainTextEdit, QTableWidget)
+
+MAIN_STYLE = """
+QMainWindow {
+    background: #171717;
+    color: #f1f1f1;
+}
+QWidget {
+    color: #f1f1f1;
+}
+QWidget#leftColumn, QScrollArea#leftScroll,
+QScrollArea#leftScroll > QWidget > QWidget {
+    background: #2b2b2b;
+}
+QWidget#rightColumn, QTabWidget#mainTabs,
+QTabWidget#mainTabs::pane, QTabWidget#mainTabs QStackedWidget,
+QTabWidget#mainTabs QStackedWidget > QWidget,
+QScrollArea#controlScroll, QScrollArea#controlScroll > QWidget > QWidget,
+QWidget#controlPage {
+    background: #171717;
+}
+QSplitter#mainSplitter::handle {
+    background: #454545;
+}
+QGroupBox, QFrame {
+    background: #242424;
+    border: 1px solid #444444;
+    border-radius: 3px;
+}
+QGroupBox {
+    padding-top: 8px;
+}
+QGroupBox::title {
+    color: #f1f1f1;
+    subcontrol-origin: padding;
+    subcontrol-position: top left;
+    padding: 0 4px;
+    background: #242424;
+}
+QPushButton, QToolButton {
+    background: #3a3a3a;
+    color: #f1f1f1;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 4px 9px;
+}
+QPushButton:hover, QToolButton:hover {
+    background: #4a4a4a;
+    border-color: #737373;
+}
+QPushButton:pressed, QToolButton:pressed {
+    background: #303030;
+}
+QPushButton:disabled, QToolButton:disabled {
+    background: #292929;
+    color: #777777;
+    border-color: #3b3b3b;
+}
+QLineEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox, QTableWidget {
+    background: #202020;
+    color: #f1f1f1;
+    border: 1px solid #555555;
+    selection-background-color: #356a9a;
+    selection-color: #ffffff;
+}
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    background: #4a4a4a;
+    border: 1px solid #666666;
+    width: 16px;
+}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {
+    background: #626262;
+}
+QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow {
+    width: 8px;
+    height: 8px;
+}
+QComboBox QAbstractItemView {
+    background: #242424;
+    color: #f1f1f1;
+    selection-background-color: #356a9a;
+}
+QCheckBox, QRadioButton {
+    color: #f1f1f1;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+    background: #202020;
+    border: 1px solid #777777;
+    border-radius: 2px;
+}
+QCheckBox::indicator:hover {
+    border-color: #bdbdbd;
+}
+QCheckBox::indicator:checked {
+    background: #202020;
+    border-color: #d0d0d0;
+}
+QCheckBox::indicator:disabled {
+    background: #292929;
+    border-color: #4a4a4a;
+}
+QTabBar::tab {
+    background: #2b2b2b;
+    color: #c8c8c8;
+    border: 1px solid #444444;
+    padding: 5px 10px;
+}
+QTabBar::tab:selected {
+    background: #3e3e3e;
+    color: #ffffff;
+}
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: #202020;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: #555555;
+    min-height: 24px;
+    min-width: 24px;
+}
+"""
 
 
 class _SpaceEstop(QObject):
@@ -45,6 +167,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        self.setStyleSheet(MAIN_STYLE)
         self.resize(1500, 920)
         self.bus = None
         self.worker: Worker | None = None
@@ -55,6 +178,7 @@ class MainWindow(QMainWindow):
         self.safety = SafetyPanel()
         self.safety.setTitle("③ 安全限制 / 急停")
         left = QWidget()
+        left.setObjectName("leftColumn")
         ll = QVBoxLayout(left)
         ll.setContentsMargins(4, 4, 4, 4)
         ll.addWidget(self.conn)
@@ -62,16 +186,20 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.safety)
         ll.addStretch(1)
         scroll = QScrollArea()
+        scroll.setObjectName("leftScroll")
         scroll.setWidget(left)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(200)
+        scroll.setMinimumWidth(300)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.card = MotorCard()
         self.control = ControlPanel()
+        self.safety.limits_changed.connect(self.control.set_output_limit)
+        self.control.setObjectName("controlPage")
         self.mini_plot = PlotWidget(capacity=60_000, compact=True)
         ctl = QSplitter(Qt.Horizontal)
         cs = QScrollArea()
+        cs.setObjectName("controlScroll")
         cs.setWidget(self.control)
         cs.setWidgetResizable(True)
         cs.setMinimumWidth(500)
@@ -85,6 +213,7 @@ class MainWindow(QMainWindow):
         self.regs = RegisterTab()
         self.scan = ScanLogTab()
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
         self.tabs.addTab(ctl, "控制")
         self.tabs.addTab(self.plot, "曲线")
         self.tabs.addTab(self.test, "响应测试")
@@ -93,6 +222,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.scan, "报文")
 
         right = QWidget()
+        right.setObjectName("rightColumn")
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.addWidget(self.card)
@@ -101,8 +231,10 @@ class MainWindow(QMainWindow):
         right.setMinimumWidth(700)
         right.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         sp = QSplitter(Qt.Horizontal)
+        sp.setObjectName("mainSplitter")
         sp.addWidget(scroll)
         sp.addWidget(right)
+        sp.setHandleWidth(2)
         sp.setOpaqueResize(True)
         sp.setChildrenCollapsible(False)
         sp.setCollapsible(0, False)
@@ -133,7 +265,12 @@ class MainWindow(QMainWindow):
     # ---------- 连接 ----------
     def connect_bus(self, p: dict):
         try:
-            bus = DemoBus() if p["sim"] else PcanBus(p["channel"], p["baud"])
+            if p.get("kind") == "socketcan":
+                bus = SocketCanBus(p["channel"])
+            elif p["sim"]:
+                bus = DemoBus()
+            else:
+                bus = PcanBus(p["channel"], p["baud"])
             bus.open()
         except Exception as e:
             QMessageBox.critical(self, "连接失败", str(e))
@@ -156,9 +293,8 @@ class MainWindow(QMainWindow):
         self.conn.set_connected(True)
         w.start()
         self.st_conn.setText(f"{bus.name} 已连接")
-        self._on_message(f"已连接 {p['channel_name']}，请扫描或添加电机")
-        if p["sim"]:
-            self.motors.sp_to.setValue(8)
+        self._on_message(f"已连接 {p['channel_name']}，开始自动扫描")
+        self.motors.scan_bus()
 
     def disconnect_bus(self):
         w = self.worker
@@ -175,6 +311,7 @@ class MainWindow(QMainWindow):
                 pass
             self.bus = None
         self.driver = None
+        self.safety.set_driver(None)
         for p_ in self.panels:
             p_.set_bound(None)
         self.conn.set_connected(False)
@@ -200,7 +337,8 @@ class MainWindow(QMainWindow):
             pl.clear()
             if drv is not None:
                 pl.set_unit(drv.out_unit, drv.out_name)
-        self.safety.set_unit(drv.out_unit if drv else "")
+        self.safety.set_driver(drv)
+        self.control.set_output_limit(self.safety.limits().out_max if drv is not None else None)
         if drv is not None:
             self.tabs.setCurrentIndex(0)
 
@@ -223,6 +361,7 @@ class MainWindow(QMainWindow):
 
     def _on_limits(self, lim, ok: bool):
         self.control.set_limits(lim, ok)
+        self.control.set_output_limit(self.safety.limits().out_max if self.driver is not None else None)
         self.regs.set_limits(lim, ok)
 
     def _on_message(self, msg: str):

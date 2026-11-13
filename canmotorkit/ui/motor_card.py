@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-                               QSpinBox)
+from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox
+
+from .widgets import CheckBox
 
 
 class MotorCard(QFrame):
@@ -14,7 +15,7 @@ class MotorCard(QFrame):
         self.lbl_title = QLabel("未选择电机")
         self.lbl_title.setStyleSheet("font-weight:bold;font-size:14px")
         self.lbl_proto = QLabel()
-        self.lbl_proto.setStyleSheet("color:#555")
+        self.lbl_proto.setStyleSheet("color:#b8b8b8")
         self.lbl_state = QLabel("—")
         self.lbl_state.setAlignment(Qt.AlignCenter)
         self.lbl_state.setMinimumWidth(150)
@@ -30,7 +31,7 @@ class MotorCard(QFrame):
         self.btn_dis = btn("失能", "达妙/HM 发 FD（会刹车）；大疆发零电流并停止输出")
         self.btn_clr = btn("清错")
         self.btn_zero = btn("设零点", "当前位置设为零点（需失能）")
-        self.chk_send = QCheckBox("发送")
+        self.chk_send = CheckBox("发送")
         self.chk_send.setToolTip("按频率发送：输出中发控制帧，否则发状态查询（大疆无需查询）")
         self.sp_rate = QSpinBox()
         self.sp_rate.setRange(10, 1000)
@@ -77,7 +78,7 @@ class MotorCard(QFrame):
         self.btn_zero.setEnabled(on and d.caps.zero)
         if d is None:
             self.lbl_title.setText("未选择电机" if self.worker else "未连接")
-            self.lbl_proto.setText("在左侧「总线电机」中扫描或添加，然后选中一台进行调试")
+            self.lbl_proto.setText("在左侧「总线电机」中扫描后，选中一台进行调试")
             self.lbl_state.setText("—")
             self.lbl_state.setStyleSheet("")
             self.lbl_info.setText("")
@@ -100,7 +101,7 @@ class MotorCard(QFrame):
         self.chk_send.setChecked(s["sending"])
         code = s["code"]
         if s["scanning"]:
-            txt, st = "扫描中", "background:#90caf9"
+            txt, st = "扫描中", "background:#90caf9;color:#102a43"
         elif not s["link_ok"]:
             txt, st = "无反馈", "background:#9e9e9e;color:white"
         elif d.caps.status_code and d.is_fault(code):
@@ -108,7 +109,7 @@ class MotorCard(QFrame):
         elif s["active"]:
             txt, st = "已使能" if d.caps.enable_cmd else "输出中", "background:#2e7d32;color:white"
         else:
-            txt, st = "失能" if d.caps.enable_cmd else "未输出", "background:#e0e0e0"
+            txt, st = "失能" if d.caps.enable_cmd else "未输出", "background:#d7d7d7;color:#222222"
         if s["tripped"] and s["active"]:
             txt += " · 零电流锁存"
         if s["running"]:
