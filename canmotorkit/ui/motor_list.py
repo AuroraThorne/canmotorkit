@@ -17,7 +17,8 @@ ALL_MODELS = [(p, m) for p, (_, ms) in PROTOCOLS.items() for m in ms]
 class _FillHeader(QHeaderView):
     """三列始终填满表格，拖动一个分界线时只调整相邻两列。"""
 
-    MIN_WIDTHS = (180, 80, 120)
+    # 左栏最窄时也能完整放下三列；拖动时仍会锁住每列的可用下限。
+    MIN_WIDTHS = (140, 55, 85)
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
@@ -33,12 +34,18 @@ class _FillHeader(QHeaderView):
         if width <= 0:
             return False
         total_min = sum(self.MIN_WIDTHS)
-        width = max(width, total_min)
-        first = max(self.MIN_WIDTHS[0], int(width * 0.50))
-        second = max(self.MIN_WIDTHS[1], int(width * 0.20))
-        third = max(self.MIN_WIDTHS[2], width - first - second)
-        if first + second + third > width:
-            first = width - second - third
+        if width >= total_min:
+            first = max(self.MIN_WIDTHS[0], int(width * 0.50))
+            second = max(self.MIN_WIDTHS[1], int(width * 0.20))
+            third = max(self.MIN_WIDTHS[2], width - first - second)
+            if first + second + third > width:
+                first = width - second - third
+        else:
+            # 极窄窗口下优先保证三列仍然存在，不让表格产生横向滚动条。
+            first = max(45, int(width * 0.50))
+            second = max(35, int(width * 0.20))
+            third = max(45, width - first - second)
+            first = max(45, width - second - third)
         self._adjusting = True
         for index, size in enumerate((first, second, third)):
             self.resizeSection(index, size)
@@ -113,7 +120,7 @@ class MotorListPanel(QGroupBox):
                                  "并读 CTRL_MODE / v_bus 区分达妙与 HM。需在失能状态下进行。")
         self.sp_to = QSpinBox()
         self.sp_to.setRange(1, 127)
-        self.sp_to.setValue(127)
+        self.sp_to.setValue(40)
         self.sp_to.setPrefix("达妙/HM ID 1~")
         self.sp_to.setToolTip("达妙/HM 使用 1~127 的 ID 查询范围；大疆不需要设置 ID，会自动监听反馈广播")
         self.lbl_dji_scan = QLabel("大疆：自动监听")
@@ -129,6 +136,7 @@ class MotorListPanel(QGroupBox):
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.tbl.itemSelectionChanged.connect(self._update_selection_style)
         hh = self.tbl.horizontalHeader()
         for column in range(3):

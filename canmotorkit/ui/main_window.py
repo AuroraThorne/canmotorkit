@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QLabel, QLineEdit
 from canmotorkit import APP_NAME
 from canmotorkit.core.bus import PcanBus
 from canmotorkit.core.worker import Worker
+from canmotorkit.core.slcan import SlcanBus
 from canmotorkit.core.socketcan import SocketCanBus
 from canmotorkit.sim.demo import DemoBus
 
@@ -189,7 +190,8 @@ class MainWindow(QMainWindow):
         scroll.setObjectName("leftScroll")
         scroll.setWidget(left)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(300)
+        # 左栏保留至少 350 px，避免控件被压缩得难以阅读。
+        scroll.setMinimumWidth(350)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.card = MotorCard()
@@ -240,7 +242,7 @@ class MainWindow(QMainWindow):
         sp.setCollapsible(0, False)
         sp.setCollapsible(1, False)
         sp.setStretchFactor(1, 1)
-        sp.setSizes([480, 1020])
+        sp.setSizes([450, 1050])
         self.setCentralWidget(sp)
 
         sb = self.statusBar()
@@ -267,6 +269,8 @@ class MainWindow(QMainWindow):
         try:
             if p.get("kind") == "socketcan":
                 bus = SocketCanBus(p["channel"])
+            elif p.get("kind") == "slcan":
+                bus = SlcanBus(p["channel"], p["bitrate"])
             elif p["sim"]:
                 bus = DemoBus()
             else:
