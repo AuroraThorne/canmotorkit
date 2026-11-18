@@ -62,31 +62,45 @@ def canable_ports() -> list[dict]:
     return out
 
 
-def encode_slcan_frame(can_id: int, data: bytes) -> bytes:
-    """编码标准 11 位 CAN 数据帧，不包含回车以外的额外控制字符。"""
-    if not 0 <= can_id <= 0x7FF:
-        raise ValueError(f"SLCAN 当前仅支持标准 11 位 CAN ID: 0x{can_id:X}")
+def encode_slcan_frame(can_id: int, data: bytes, extended: bool = False,
+                       rtr: bool = False, dlc: int | None = None) -> bytes:
+    """编码经典 CAN 数据/远程帧，支持标准/扩展 ID。"""
+    limit = 0x1FFFFFFF if extended else 0x7FF
+    if not 0 <= can_id <= limit:
+        raise ValueError(f"SLCAN CAN ID 超出范围: 0x{can_id:X}")
     if len(data) > 8:
         raise ValueError("经典 CAN 数据长度不能超过 8 字节")
-    return f"t{can_id:03X}{len(data):X}{bytes(data).hex().upper()}\r".encode("ascii")
+    wire_dlc = len(data) if dlc is None else dlc
+    if not 0 <= wire_dlc <= 8:
+        raise ValueError("DLC 必须在 0~8 之间")
+    prefix = "R" if extended and rtr else "T" if extended else "r" if rtr else "t"
+    id_width = 8 if extended else 3
+    payload = "" if rtr else bytes(data).hex().upper()
+    return f"{prefix}{can_id:0{id_width}X}{wire_dlc:X}{payload}\r".encode("ascii")
 
 
-def parse_slcan_frame(line: bytes | bytearray | str) -> tuple[int, bytes] | None:
-    """解析一行标准 SLCAN 数据帧；状态行、远程帧和错误行返回 None。"""
+def parse_slcan_frame(line: bytes | bytearray | str, with_flags: bool = False):
+    """解析标准/扩展数据帧和远程帧。"""
     if isinstance(line, (bytes, bytearray)):
         line = bytes(line).decode("ascii", "ignore")
     line = line.strip()
-    if not line or line[0] != "t":
+    if not line or line[0] not in "tTrR":
         return None
-    if len(line) < 5:
+    extended = line[0] in "TR"
+    rtr = line[0] in "rR"
+    if not with_flags and (extended or rtr):
+        return None
+    id_width = 8 if extended else 3
+    if len(line) < 2 + id_width:
         return None
     try:
-        can_id = int(line[1:4], 16)
-        dlc = int(line[4], 16)
-        payload = line[5:5 + dlc * 2]
-        if dlc > 8 or len(payload) != dlc * 2:
+        can_id = int(line[1:1 + id_width], 16)
+        dlc = int(line[1 + id_width], 16)
+        payload = line[2 + id_width:2 + id_width + dlc * 2]
+        if dlc > 8 or (not rtr and len(payload) != dlc * 2):
             return None
-        return can_id, bytes.fromhex(payload)
+        result = can_id, b"" if rtr else bytes.fromhex(payload), extended, rtr, dlc
+        return result if with_flags else result[:2]
     except ValueError:
         return None
 
@@ -142,11 +156,12 @@ class SlcanBus(CanBus):
         self._serial.write((command + "\r").encode("ascii"))
         self._serial.flush()
 
-    def send(self, can_id: int, data: bytes) -> None:
+    def send(self, can_id: int, data: bytes, extended: bool = False,
+             rtr: bool = False, dlc: int | None = None) -> None:
         if self._serial is None:
             raise BusError("SLCAN 尚未打开")
         try:
-            self._serial.write(encode_slcan_frame(can_id, data))
+            self._serial.write(encode_slcan_frame(can_id, data, extended, rtr, dlc))
             self._serial.flush()
         except Exception as e:
             raise BusError(f"SLCAN 发送失败: {e}") from e
@@ -164,10 +179,11 @@ class SlcanBus(CanBus):
         while b"\r" in self._rx:
             raw, _, rest = self._rx.partition(b"\r")
             self._rx = bytearray(rest)
-            decoded = parse_slcan_frame(raw)
+            decoded = parse_slcan_frame(raw, with_flags=True)
             if decoded is not None:
-                can_id, data = decoded
-                out.append(Frame(time.perf_counter(), can_id, data))
+                can_id, data, extended, rtr, dlc = decoded
+                out.append(Frame(time.perf_counter(), can_id, data,
+                                 extended=extended, rtr=rtr, dlc=dlc))
         return out
 
     def status_text(self) -> str:

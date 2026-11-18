@@ -41,6 +41,7 @@ class Sample:
     active: bool            # 电机输出中
     ref: float = NAN        # 测试激励/闭环参考值
     mit: P.MitCommand | None = None
+    pid_components: tuple[float, float, float] | None = None
 
 
 @dataclass
@@ -70,7 +71,7 @@ class Worker(QThread):
         super().__init__()
         self.bus = bus
         self.driver: Driver | None = None
-        self.rate_hz = 200.0
+        self.rate_hz = 1000.0
         self.sending = False
         self.mode = "current"           # current / mit
         self.req_timeout = 0.1
@@ -89,6 +90,7 @@ class Worker(QThread):
         self._pending: _Req | None = None
         self._lim_vals: dict[int, float] = {}
         self._scan: dict | None = None
+        self._raw_periodic: dict | None = None
         self._run_obj = None
         self._gc_was = True
         self._running = False
@@ -141,6 +143,10 @@ class Worker(QThread):
     def set_target_out(self, v: float):
         with self._lock:
             self._target_out = float(v)
+
+    def zero_output(self):
+        """在线程内立即发送零输出帧，并清除当前输出目标。"""
+        self._post(self._do_zero_output)
 
     def set_target_mit(self, cmd: P.MitCommand):
         with self._lock:
@@ -208,8 +214,19 @@ class Worker(QThread):
     def stop_scan(self):
         self._post(self._do_stop_scan)
 
-    def send_raw(self, can_id: int, data: bytes):
-        self._post(self._send, can_id, bytes(data))
+    def send_raw(self, can_id: int, data: bytes, extended: bool = False,
+                 rtr: bool = False, dlc: int | None = None):
+        self._post(self._send, can_id, bytes(data), extended, rtr, dlc)
+
+    def start_raw_periodic(self, can_id: int, data: bytes, frequency: float,
+                           extended: bool = False, rtr: bool = False,
+                           dlc: int | None = None):
+        """在线程内按指定频率发送原始帧，不经过电机安全限制。"""
+        self._post(self._do_start_raw_periodic, can_id, bytes(data), float(frequency),
+                   extended, rtr, dlc)
+
+    def stop_raw_periodic(self):
+        self._post(self._do_stop_raw_periodic)
 
     def start_run(self, run):
         self._post(self._do_start_run, run)
@@ -230,14 +247,16 @@ class Worker(QThread):
             self._last_err_t = now
             self.message.emit("错误: " + s)
 
-    def _send(self, can_id: int, data: bytes) -> bool:
+    def _send(self, can_id: int, data: bytes, extended: bool = False,
+              rtr: bool = False, dlc: int | None = None) -> bool:
         try:
-            self.bus.send(can_id, data)
+            self.bus.send(can_id, data, extended=extended, rtr=rtr, dlc=dlc)
         except BusError as e:
             self._err(str(e))
             return False
         if self.log_enabled:
-            self._frames.append(Frame(time.perf_counter(), can_id, bytes(data), True))
+            self._frames.append(Frame(time.perf_counter(), can_id, bytes(data), True,
+                                      extended, rtr, dlc))
         return True
 
     def _send_all(self, frames) -> bool:
@@ -278,6 +297,7 @@ class Worker(QThread):
         if self.active:
             self._msg("请先失能当前电机再切换")
             return
+        self._do_stop_raw_periodic()
         self._abort_run("切换电机")
         self._apply_driver(driver)
         self.limits_changed.emit(self.lim, self.limits_ok)
@@ -355,7 +375,12 @@ class Worker(QThread):
         if d is None:
             return
         self._abort_run("失能")
+        with self._lock:
+            self._target_out = 0.0
+            self._target_mit = P.MitCommand()
         if d.caps.enable_cmd:
+            # 先撤掉扭矩/电流指令，再发送失能，避免保留上一条输出。
+            self._send_all(d.stop_frames())
             if self._send_all(d.disable_frames()) and self.motor_code == P.CODE_ENABLED:
                 self.motor_code = P.CODE_DISABLED      # 立即改发 idle 帧，以后续反馈为准
             self._msg("已发送失能")
@@ -363,6 +388,13 @@ class Worker(QThread):
             self._sw_en = False
             self._send_all(d.stop_frames())
             self._msg("已失能（发送零电流）")
+
+    def _do_zero_output(self):
+        with self._lock:
+            self._target_out = 0.0
+        d = self.driver
+        if d is not None and self.active:
+            self._send_all(d.stop_frames())
 
     def _do_estop(self, reason: str):
         self._abort_run(reason)
@@ -392,6 +424,7 @@ class Worker(QThread):
         self.safety.mt.reset()
 
     def _do_shutdown(self):
+        self._do_stop_raw_periodic()
         self._abort_run("退出")
         if self.driver is not None and self.active:
             self._send_all(self.driver.stop_frames())
@@ -441,6 +474,34 @@ class Worker(QThread):
     def _abort_run(self, reason: str):
         if self._run_obj is not None:
             self._finish_run(self._run_obj, reason)
+
+    # ---------- 原始帧周期发送 ----------
+    def _do_start_raw_periodic(self, can_id: int, data: bytes, frequency: float,
+                               extended: bool = False, rtr: bool = False,
+                               dlc: int | None = None):
+        if frequency <= 0.0:
+            self._do_stop_raw_periodic()
+            return
+        self._raw_periodic = {
+            "can_id": int(can_id),
+            "data": bytes(data),
+            "period": 1.0 / frequency,
+            "next": time.perf_counter(),
+            "extended": bool(extended),
+            "rtr": bool(rtr),
+            "dlc": dlc,
+        }
+
+    def _do_stop_raw_periodic(self):
+        self._raw_periodic = None
+
+    def _service_raw_periodic(self, now: float):
+        task = self._raw_periodic
+        if task is None or now < task["next"]:
+            return
+        task["next"] = now + task["period"]
+        self._send(task["can_id"], task["data"], task["extended"],
+                   task["rtr"], task["dlc"])
 
     # ---------- 配置 ----------
     def _do_read(self, rid: int):
@@ -646,12 +707,17 @@ class Worker(QThread):
         elif not self.safety.tripped:
             self._trip_reported = False
         run = self._run_obj
+        pid_components = None
         if run is not None:
             run.record(f.t, self._last_out, fb, self.safety.pos)
+            get_components = getattr(run, "components", None)
+            if get_components is not None:
+                pid_components = get_components()
         act = self.active
         return Sample(f.t, self._last_out if act else NAN, fb, self.safety.pos, act,
                       run.ref if run is not None else NAN,
-                      self._last_mit if act and self.mode == "mit" else None)
+                      self._last_mit if act and self.mode == "mit" else None,
+                      pid_components)
 
     # ---------- 发送 ----------
     def _tick(self, now: float) -> bool:
@@ -677,6 +743,12 @@ class Worker(QThread):
                     self._finish_run(run)
                     u = 0.0
                 out = self.safety.filter_output(now, u)
+                track = getattr(run, "track_output", None)
+                if track is not None:
+                    actual = out
+                    if d.out_max > 0:
+                        actual = max(-d.out_max, min(d.out_max, actual))
+                    track(actual)
                 fr = d.output_frames(out)
             elif self.mode == "mit" and d.caps.mit:
                 cmd = self.get_target()
@@ -757,6 +829,7 @@ class Worker(QThread):
                 else:
                     next_tx = now
                     self._last_out = NAN
+                self._service_raw_periodic(now)
                 self._service_config(now)
                 self._service_scan(now)
                 if now >= next_bus_check:

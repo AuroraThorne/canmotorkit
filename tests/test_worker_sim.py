@@ -171,7 +171,7 @@ def test_response_and_loop_on_demo(app):
         w.enable()
         assert pump(app, 0.5, lambda: w.active)
         run = ExciteRun(ExciteConfig(kind="stepsine", amp=1.5, f0=2, f1=20, n_freq=5, cycles=4,
-                                     min_seg=0.2, bias_vel=8.0, bias_kp=0.3))
+                                     min_seg=0.2))
         w.start_run(run)
         assert pump(app, 8.0, lambda: run.done), r.rec["msgs"]
         assert not run.reason, run.reason

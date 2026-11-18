@@ -266,7 +266,8 @@ class DemoBus(CanBus):
                         if isinstance(m, DjiSimMotor):
                             self._push(now, m.fb_id, m.feedback())
 
-    def send(self, can_id: int, data: bytes) -> None:
+    def send(self, can_id: int, data: bytes, extended: bool = False,
+             rtr: bool = False, dlc: int | None = None) -> None:
         if not self._run:
             raise BusError("总线未打开")
         with self._lock:

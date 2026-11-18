@@ -1,10 +1,8 @@
-"""顶部电机卡片：当前电机、状态、使能/失能/清错/设零、发送开关 + 频率。"""
+"""电机操作卡片：使能/失能、清错/设零和发送频率。"""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox
-
-from .widgets import CheckBox
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget
 
 
 class MotorCard(QFrame):
@@ -12,10 +10,14 @@ class MotorCard(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
         self.worker = None
+        self.driver = None
+        self._active = False
         self.lbl_title = QLabel("未选择电机")
-        self.lbl_title.setStyleSheet("font-weight:bold;font-size:14px")
-        self.lbl_proto = QLabel()
-        self.lbl_proto.setStyleSheet("color:#b8b8b8")
+        self.lbl_title.setObjectName("motorTitle")
+        self.lbl_title.setStyleSheet(
+            "QLabel#motorTitle{border:none;background:transparent;"
+            "font-weight:bold;font-size:14px;padding:0;}"
+        )
         self.lbl_state = QLabel("—")
         self.lbl_state.setAlignment(Qt.AlignCenter)
         self.lbl_state.setMinimumWidth(150)
@@ -31,37 +33,38 @@ class MotorCard(QFrame):
         self.btn_dis = btn("失能", "达妙/HM 发 FD（会刹车）；大疆发零电流并停止输出")
         self.btn_clr = btn("清错")
         self.btn_zero = btn("设零点", "当前位置设为零点（需失能）")
-        self.chk_send = CheckBox("发送")
-        self.chk_send.setToolTip("按频率发送：输出中发控制帧，否则发状态查询（大疆无需查询）")
         self.sp_rate = QSpinBox()
         self.sp_rate.setRange(10, 1000)
-        self.sp_rate.setValue(200)
+        self.sp_rate.setValue(1000)
         self.sp_rate.setSuffix(" Hz")
         self.lbl_rate = QLabel("—")
-        self.lbl_rate.setMinimumWidth(170)
+        self.lbl_rate.setMinimumWidth(0)
 
-        g = QGridLayout(self)
-        g.setContentsMargins(8, 4, 8, 4)
-        g.addWidget(self.lbl_title, 0, 0)
-        g.addWidget(self.lbl_proto, 1, 0)
-        g.addWidget(self.lbl_state, 0, 1)
-        g.addWidget(self.lbl_info, 1, 1, 1, 2)
-        b = QHBoxLayout()
-        for w in (self.btn_en, self.btn_dis, self.btn_clr, self.btn_zero):
-            b.addWidget(w)
-        g.addLayout(b, 0, 2)
-        s = QHBoxLayout()
-        s.addWidget(self.chk_send)
-        s.addWidget(self.sp_rate)
-        s.addWidget(self.lbl_rate)
-        g.addLayout(s, 0, 3)
-        g.setColumnStretch(0, 1)
+        self.output_panel = QWidget()
+        output_row = QHBoxLayout(self.output_panel)
+        output_row.setContentsMargins(8, 4, 8, 4)
+        output_row.setSpacing(6)
+        output_row.addWidget(self.btn_en, 1)
+        output_row.addWidget(self.btn_dis, 1)
 
-        self.btn_en.clicked.connect(lambda: self.worker and self.worker.enable())
+        self.service_panel = QFrame()
+        service_row = QHBoxLayout(self.service_panel)
+        service_row.setContentsMargins(0, 0, 0, 0)
+        service_row.setSpacing(6)
+        service_row.addWidget(self.btn_clr, 1)
+        service_row.addWidget(self.btn_zero, 1)
+
+        self.rate_panel = QWidget()
+        rate_row = QHBoxLayout(self.rate_panel)
+        rate_row.setContentsMargins(0, 0, 0, 0)
+        rate_row.addWidget(QLabel("目标"))
+        rate_row.addWidget(self.sp_rate)
+        rate_row.addWidget(self.lbl_rate, 1)
+
+        self.btn_en.clicked.connect(self._toggle_output)
         self.btn_dis.clicked.connect(lambda: self.worker and self.worker.disable())
         self.btn_clr.clicked.connect(lambda: self.worker and self.worker.clear_error())
         self.btn_zero.clicked.connect(lambda: self.worker and self.worker.set_zero())
-        self.chk_send.clicked.connect(lambda on: self.worker and self.worker.set_sending(on))
         self.sp_rate.valueChanged.connect(self._rate)
         self.set_bound(None)
 
@@ -71,59 +74,78 @@ class MotorCard(QFrame):
         self.set_driver(None)
 
     def set_driver(self, d):
+        self.driver = d
         on = self.worker is not None and d is not None
-        for w in (self.btn_en, self.btn_dis, self.chk_send, self.sp_rate):
+        self._active = False
+        for w in (self.btn_en, self.btn_dis, self.sp_rate):
             w.setEnabled(on)
         self.btn_clr.setEnabled(on and d.caps.clear)
         self.btn_zero.setEnabled(on and d.caps.zero)
+        has_clear = d is not None and d.caps.clear
+        has_zero = d is not None and d.caps.zero
+        self.btn_clr.setVisible(has_clear)
+        self.btn_zero.setVisible(has_zero)
+        self.service_panel.setVisible(has_clear or has_zero)
+        if self.worker:
+            self.worker.set_sending(on)
         if d is None:
             self.lbl_title.setText("未选择电机" if self.worker else "未连接")
-            self.lbl_proto.setText("在左侧「总线电机」中扫描后，选中一台进行调试")
             self.lbl_state.setText("—")
             self.lbl_state.setStyleSheet("")
             self.lbl_info.setText("")
             self.lbl_rate.setText("—")
+            self.btn_en.setText("使能")
+            self.btn_dis.setText("失能")
+            self.btn_en.setStyleSheet("")
             return
-        self.lbl_title.setText(d.title())
-        self.lbl_proto.setText(f"协议：{d.protocol_name}　输出单位：{d.out_name}（{d.out_unit}）"
-                               + (f"　{d.note}" if d.note else ""))
+        self.lbl_title.setText(d.model)
         self.btn_en.setText("使能" if d.caps.enable_cmd else "开始输出")
         self.btn_dis.setText("失能" if d.caps.enable_cmd else "停止输出")
+        self.btn_en.setStyleSheet("")
 
     def _rate(self):
         if self.worker:
             self.worker.rate_hz = float(self.sp_rate.value())
 
+    def _toggle_output(self):
+        if not self.worker:
+            return
+        if self.driver is not None and not self.driver.caps.enable_cmd and self._active:
+            self.worker.disable()
+        else:
+            self.worker.enable()
+
     def on_state(self, s: dict):
         d = s["driver"]
         if d is None:
             return
-        self.chk_send.setChecked(s["sending"])
+        self._active = bool(s["active"])
         code = s["code"]
         if s["scanning"]:
             txt, st = "扫描中", "background:#90caf9;color:#102a43"
         elif not s["link_ok"]:
-            txt, st = "无反馈", "background:#9e9e9e;color:white"
+            txt, st = "无反馈", "background:#9e9e9e;color:#202020"
         elif d.caps.status_code and d.is_fault(code):
             txt, st = d.code_text(code), "background:#c62828;color:white"
         elif s["active"]:
-            txt, st = "已使能" if d.caps.enable_cmd else "输出中", "background:#2e7d32;color:white"
+            txt, st = ("已使能", "background:#2e7d32;color:white") if d.caps.enable_cmd else ("", "")
         else:
-            txt, st = "失能" if d.caps.enable_cmd else "未输出", "background:#d7d7d7;color:#222222"
+            txt, st = ("失能", "background:#d7d7d7;color:#222222") if d.caps.enable_cmd else ("", "")
         if s["tripped"] and s["active"]:
-            txt += " · 零电流锁存"
+            txt = (txt + " · " if txt else "") + "零电流锁存"
         if s["running"]:
-            txt += " · 测试中"
+            txt = (txt + " · " if txt else "") + "测试中"
         self.lbl_state.setText(txt)
-        self.lbl_state.setStyleSheet(st + ";font-weight:bold;padding:3px;border-radius:3px")
-        if not s["sending"]:
-            what = "已关闭"
-        elif s["active"]:
+        self.lbl_state.setStyleSheet(st + ";font-weight:bold;padding:3px;border-radius:3px" if st else "")
+        if not d.caps.enable_cmd:
+            active = bool(s["active"])
+            self.btn_en.setText("输出中" if active else "开始输出")
+            self.btn_en.setStyleSheet(
+                "QPushButton{background:#2e7d32;color:white;font-weight:bold;}"
+                if active else ""
+            )
+        if s["active"]:
             what = "MIT 帧" if s["mode"] == "mit" else f"{d.out_name}指令"
         else:
-            what = "状态查询" if d.idle_frames() else "无（等待使能）"
-        self.lbl_rate.setText(f"{what} {s['tx_rate']:.0f} Hz")
-        lat = s.get("lat") or {}
-        lat_t = (f"往返 p50 {lat['p50'] * 1000:.2f} / p95 {lat['p95'] * 1000:.2f} ms"
-                 if lat else "")
-        self.lbl_info.setText(f"总线 {s['bus']}　{lat_t}")
+            what = "状态查询" if d.idle_frames() else "未输出"
+        self.lbl_rate.setText(f"实际 {what} {s['tx_rate']:.0f} Hz")

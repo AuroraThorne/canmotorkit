@@ -116,9 +116,24 @@ class DjiDriver(Driver):
         cid, slot = self.ctrl
         if tx and can_id == cid and len(data) == 8:
             raw = _i16(data[2 * slot], data[2 * slot + 1])
-            return f"电流指令 {raw / self.m.raw_max * self.m.amp_max:+.3f} A"
+            return f"下发电流: {raw / self.m.raw_max * self.m.amp_max:+.3f} A"
         if not tx and can_id == self.fb_id:
-            return "反馈"
+            if len(data) < 7:
+                return "反馈（数据长度不足）"
+            ang = (data[0] << 8) | data[1]
+            rpm = _i16(data[2], data[3])
+            cur = _i16(data[4], data[5])
+            rotor = ang / 8192.0 * 2 * math.pi
+            if rotor >= math.pi:
+                rotor -= 2 * math.pi
+            pos = rotor / self.m.gr
+            current = cur / self.m.raw_max * self.m.amp_max
+            position_text = f"{pos:>8.5f}"
+            speed_text = f"{rpm:>5d}"
+            current_text = f"{current:>+8.5f}"
+            temperature_text = f", 温度: {data[6]:>3.0f} °C" if self.m.has_temp else ""
+            return (f"位置: {position_text} rad, 速度: {speed_text} rpm, "
+                    f"电流: {current_text} A{temperature_text}")
         return ""
 
 

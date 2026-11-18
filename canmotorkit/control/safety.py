@@ -14,13 +14,15 @@ from dataclasses import dataclass
 
 @dataclass
 class SafetyLimits:
-    vel_max: float = 10.0          # |速度| 上限 rad/s；0 = 不检查
+    vel_max: float = 10.0          # |速度| 上限 rad/s
     pos_enabled: bool = False      # 是否启用位置窗口
     pos_min: float = -6.0          # 多圈累计位置窗口 rad（相对累计原点）
     pos_max: float = 6.0
-    out_max: float = 1.0           # |电流/扭矩指令| 限幅（厂家单位）；超出则限幅而非触发
-    temp_max: float = 80.0         # ℃；0 = 不检查
+    out_max: float = 1.0           # |电流/扭矩指令| 限幅（厂家单位）
+    temp_max: float = 100.0        # ℃；0 = 不检查
     fb_timeout: float = 0.1        # 输出非零时反馈超时 s；0 = 不检查
+    vel_enabled: bool = True       # 是否启用速度限幅
+    out_enabled: bool = True       # 是否启用当前协议对应的输出限幅
 
 
 class MultiTurn:
@@ -80,7 +82,7 @@ class Supervisor:
 
     def _check_state(self, vel: float, temp: float) -> str:
         L = self.limits
-        if L.vel_max > 0 and abs(vel) > L.vel_max:
+        if L.vel_enabled and L.vel_max > 0 and abs(vel) > L.vel_max:
             return f"速度超限 {vel:+.3f} rad/s（限 ±{L.vel_max:g}）"
         if L.pos_enabled and not (L.pos_min <= self.pos <= L.pos_max):
             return f"位置超限 {self.pos:+.3f} rad（窗口 [{L.pos_min:g}, {L.pos_max:g}]）"
@@ -110,6 +112,6 @@ class Supervisor:
             self.trip(f"反馈超时 >{L.fb_timeout * 1000:.0f} ms")
         if self.tripped:
             return 0.0
-        if L.out_max > 0:
+        if L.out_enabled and L.out_max > 0:
             out = max(-L.out_max, min(L.out_max, out))
         return out

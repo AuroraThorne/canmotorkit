@@ -13,3 +13,9 @@ def test_slcan_ignores_non_data_and_invalid_frames():
     assert parse_slcan_frame(b"r1230") is None
     assert parse_slcan_frame(b"t1239") is None
     assert parse_slcan_frame(b"t1232AA") is None
+
+
+def test_slcan_extended_and_remote_frames():
+    raw = encode_slcan_frame(0x1ABCDE, b"", extended=True, rtr=True, dlc=8)
+    assert raw == b"R001ABCDE8\r"
+    assert parse_slcan_frame(raw[:-1], with_flags=True) == (0x1ABCDE, b"", True, True, 8)

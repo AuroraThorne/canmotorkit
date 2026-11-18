@@ -52,7 +52,7 @@ class SafetyPanel(QGroupBox):
         self.btn_estop.setFocusPolicy(Qt.NoFocus)
         self.btn_estop.setMinimumHeight(40)
         self.btn_estop.setStyleSheet("QPushButton{background:#c62828;color:white;font-weight:bold;"
-                                     "font-size:15px}QPushButton:disabled{background:#9e9e9e}")
+                                     "font-size:15px}QPushButton:disabled{background:#9e9e9e;color:#202020}")
         self.btn_estop.setToolTip("发送 kp=kd=t=0 并锁存，电机保持使能（失能会猛刹车）。\n"
                                   "需要失能请点击上方「失能」。")
         self.lbl_state = QLabel("安全：")
@@ -66,13 +66,19 @@ class SafetyPanel(QGroupBox):
         self.sp_vel = _spin(0, 1000, d.vel_max, 2, 1, " rad/s")
         self.sp_vel.setPrefix("± ")
         self.sp_vel.setToolTip("0 = 不检查")
+        self.chk_vel = CheckBox("速度上限")
+        self.chk_vel.setToolTip("启用速度上限")
         self.sp_current = _spin(0, 1000, d.out_max, 3, 0.1, " A")
         self.sp_current.setPrefix("± ")
         self.sp_current.setToolTip("大疆电调电流指令限幅；超出则限幅")
+        self.chk_current = CheckBox("电流限幅")
+        self.chk_current.setToolTip("启用电流限幅")
         self.sp_torque = _spin(0, 1000, d.out_max, 3, 0.1, " Nm")
         self.sp_torque.setPrefix("± ")
         self.sp_torque.setToolTip("达妙/HM 扭矩指令限幅；超出则限幅")
-        self.chk_pos = CheckBox("启用位置窗口（多圈累计）")
+        self.chk_torque = CheckBox("扭矩限幅")
+        self.chk_torque.setToolTip("启用扭矩限幅")
+        self.chk_pos = CheckBox("启用位置窗口")
         self.sp_pmin = _spin(-1000, 0, d.pos_min, 3, 0.5, " rad")
         self.sp_pmax = _spin(0, 1000, d.pos_max, 3, 0.5, " rad")
         self.btn_pzero = QPushButton("以当前位置为窗口零点")
@@ -82,20 +88,27 @@ class SafetyPanel(QGroupBox):
         self.sp_to = _spin(0, 1000, d.fb_timeout * 1000, 0, 10, " ms")
         self.sp_to.setToolTip("输出非零时连续无反馈的超时；0 = 不检查")
         f = QFormLayout()
-        f.addRow("速度上限", self.sp_vel)
-        f.addRow("电流限幅", self.sp_current)
-        f.addRow("扭矩限幅", self.sp_torque)
-        f.addRow(self.chk_pos)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Min"))
-        row.addWidget(self.sp_pmin)
-        row.addSpacing(8)
-        row.addWidget(QLabel("Max"))
-        row.addWidget(self.sp_pmax)
-        f.addRow("位置窗口", row)
-        f.addRow(self.btn_pzero)
         f.addRow("温度上限", self.sp_temp)
         f.addRow("反馈超时", self.sp_to)
+        position_row = QHBoxLayout()
+        position_row.setContentsMargins(0, 0, 0, 0)
+        position_row.addWidget(self.chk_pos)
+        position_row.addStretch(1)
+        position_row.addWidget(self.btn_pzero)
+        f.addRow(position_row)
+        min_row = QHBoxLayout()
+        min_row.setContentsMargins(0, 0, 0, 0)
+        min_row.addWidget(QLabel("Min"))
+        min_row.addWidget(self.sp_pmin, 1)
+        max_row = QHBoxLayout()
+        max_row.setContentsMargins(0, 0, 0, 0)
+        max_row.addWidget(QLabel("Max"))
+        max_row.addWidget(self.sp_pmax, 1)
+        f.addRow("位置窗口", min_row)
+        f.addRow("", max_row)
+        f.addRow(self.chk_vel, self.sp_vel)
+        f.addRow(self.chk_current, self.sp_current)
+        f.addRow(self.chk_torque, self.sp_torque)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.btn_estop)
@@ -104,6 +117,7 @@ class SafetyPanel(QGroupBox):
         r2.addWidget(self.btn_reset)
         lay.addLayout(r2)
         lay.addLayout(f)
+        self._content_layout = lay
 
         self.btn_estop.clicked.connect(self.estop)
         self.btn_reset.clicked.connect(lambda: self.worker and self.worker.reset_safety())
@@ -111,15 +125,19 @@ class SafetyPanel(QGroupBox):
         for w in (self.sp_vel, self.sp_current, self.sp_torque, self.sp_pmin, self.sp_pmax,
                   self.sp_temp, self.sp_to):
             w.valueChanged.connect(self._push)
-        self.chk_pos.toggled.connect(self._push)
+        for w in (self.chk_vel, self.chk_current, self.chk_torque, self.chk_pos):
+            w.toggled.connect(self._push)
         self.set_driver(None)
         self.set_bound(None)
 
     def limits(self) -> SafetyLimits:
+        output_spin = self.sp_current if self._output_kind == "current" else self.sp_torque
+        output_check = self.chk_current if self._output_kind == "current" else self.chk_torque
         return SafetyLimits(vel_max=self.sp_vel.value(), pos_enabled=self.chk_pos.isChecked(),
+                            vel_enabled=self.chk_vel.isChecked(),
                             pos_min=self.sp_pmin.value(), pos_max=self.sp_pmax.value(),
-                            out_max=(self.sp_current if self._output_kind == "current" else self.sp_torque).value()
-                            if self._output_kind else 0.0,
+                            out_max=output_spin.value() if self._output_kind else 0.0,
+                            out_enabled=output_check.isChecked() if self._output_kind else False,
                             temp_max=self.sp_temp.value(),
                             fb_timeout=self.sp_to.value() / 1000.0)
 
@@ -135,6 +153,12 @@ class SafetyPanel(QGroupBox):
             self.lbl_state.setStyleSheet("")
         self._update_buttons()
 
+    def set_output_controls(self, output_panel, service_panel, rate_panel):
+        """把电机操作控件全部放在安全限制分组内。"""
+        self._content_layout.insertWidget(0, output_panel)
+        self._content_layout.addWidget(service_panel)
+        self._content_layout.addWidget(rate_panel)
+
     def set_driver(self, d):
         self.driver = d
         self._output_kind = "" if d is None else ("torque" if d.out_name == "扭矩" else "current")
@@ -146,16 +170,34 @@ class SafetyPanel(QGroupBox):
             self.chk_pos.setChecked(False)
             self.chk_pos.setEnabled(False)
             self.chk_pos.blockSignals(False)
+            for check in (self.chk_vel, self.chk_current, self.chk_torque):
+                check.blockSignals(True)
+                check.setChecked(False)
+                check.setEnabled(False)
+                check.blockSignals(False)
             self._update_buttons()
             self._push()
             return
 
         defaults = SafetyLimits()
-        self._fill_spin(self.sp_vel, defaults.vel_max, "± ", " rad/s")
-        self._fill_spin(self.sp_current, defaults.out_max, "± ", " A",
+        ui_vel_max = 50.0
+        ui_out_max = min(20.0, max(0.0, float(d.out_max)))
+        self._fill_spin(self.sp_vel, ui_vel_max, "± ", " rad/s")
+        self._fill_spin(self.sp_current, ui_out_max, "± ", " A",
                         active=self._output_kind == "current")
-        self._fill_spin(self.sp_torque, defaults.out_max, "± ", " Nm",
+        self._fill_spin(self.sp_torque, ui_out_max, "± ", " Nm",
                         active=self._output_kind == "torque")
+        for spin, active in ((self.sp_vel, True),
+                             (self.sp_current, self._output_kind == "current"),
+                             (self.sp_torque, self._output_kind == "torque")):
+            spin.setVisible(True)
+        for check, active in ((self.chk_vel, True),
+                              (self.chk_current, self._output_kind == "current"),
+                              (self.chk_torque, self._output_kind == "torque")):
+            check.blockSignals(True)
+            check.setChecked(False)
+            check.setEnabled(active)
+            check.blockSignals(False)
         self.chk_pos.blockSignals(True)
         self.chk_pos.setChecked(defaults.pos_enabled)
         self.chk_pos.setEnabled(True)
@@ -202,11 +244,37 @@ class SafetyPanel(QGroupBox):
         if self.worker:
             self.worker.estop()
 
+    def raise_for_test(self, vel_max: float = 0.0, out_max: float = 0.0) -> bool:
+        """把测试明确需要的速度/输出范围同步到左侧安全限制。
+
+        这里只提升限制，不降低用户已经设置的更大值；输出仍受当前电机协议量程约束。
+        """
+        if self.driver is None:
+            return False
+        changed = False
+        if vel_max > self.sp_vel.value():
+            self.sp_vel.blockSignals(True)
+            self.sp_vel.setValue(min(1000.0, float(vel_max)))
+            self.sp_vel.blockSignals(False)
+            changed = True
+        output_spin = self.sp_current if self._output_kind == "current" else self.sp_torque
+        if out_max > output_spin.value():
+            protocol_max = max(0.0, float(self.driver.out_max))
+            target = min(1000.0, protocol_max, float(out_max))
+            if target > output_spin.value():
+                output_spin.blockSignals(True)
+                output_spin.setValue(target)
+                output_spin.blockSignals(False)
+                changed = True
+        if changed:
+            self._push()
+        return changed
+
     def _push(self):
         lim = self.limits()
         if self.worker:
             self.worker.set_safety_limits(lim)
-        self.limits_changed.emit(lim.out_max if self.driver is not None else 0.0)
+        self.limits_changed.emit(lim.out_max if self.driver is not None and lim.out_enabled else 0.0)
 
     def on_state(self, s: dict):
         if self.worker is None:

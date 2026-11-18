@@ -12,6 +12,14 @@ class Frame:
     can_id: int
     data: bytes
     tx: bool = False
+    extended: bool = False
+    rtr: bool = False
+    dlc: int | None = None
+
+    @property
+    def wire_dlc(self) -> int:
+        """报文在线上的 DLC；RTR 帧不能从 data 长度推断。"""
+        return len(self.data) if self.dlc is None else self.dlc
 
 
 class CanBus:
@@ -19,7 +27,8 @@ class CanBus:
 
     def open(self) -> None: ...
     def close(self) -> None: ...
-    def send(self, can_id: int, data: bytes) -> None: ...
+    def send(self, can_id: int, data: bytes, extended: bool = False,
+             rtr: bool = False, dlc: int | None = None) -> None: ...
     def recv_all(self) -> list[Frame]: return []
     def status_text(self) -> str: return "OK"
 
@@ -49,13 +58,17 @@ class PcanBus(CanBus):
             self.api.uninitialize(self.ch)
             self._open = False
 
-    def send(self, can_id: int, data: bytes) -> None:
-        r = self.api.write(self.ch, can_id, data)
+    def send(self, can_id: int, data: bytes, extended: bool = False,
+             rtr: bool = False, dlc: int | None = None) -> None:
+        r = self.api.write(self.ch, can_id, data, extended=extended,
+                           rtr=rtr, dlc=dlc)
         if r != 0:
             raise BusError(f"发送失败: {self.api.error_text(r)}")
 
     def recv_all(self) -> list[Frame]:
-        from .pcan_basic import PCAN_ERROR_QRCVEMPTY, PCAN_MESSAGE_STATUS, PCAN_MESSAGE_RTR, PCAN_MESSAGE_ERRFRAME
+        from .pcan_basic import (PCAN_ERROR_QRCVEMPTY, PCAN_MESSAGE_STATUS,
+                                 PCAN_MESSAGE_RTR, PCAN_MESSAGE_EXTENDED,
+                                 PCAN_MESSAGE_ERRFRAME)
         out = []
         for _ in range(512):
             r, msg, _ts = self.api.read(self.ch)
@@ -63,9 +76,13 @@ class PcanBus(CanBus):
                 break
             if r != 0:
                 break
-            if msg.MSGTYPE & (PCAN_MESSAGE_STATUS | PCAN_MESSAGE_RTR | PCAN_MESSAGE_ERRFRAME):
+            if msg.MSGTYPE & (PCAN_MESSAGE_STATUS | PCAN_MESSAGE_ERRFRAME):
                 continue
-            out.append(Frame(time.perf_counter(), msg.ID, bytes(msg.DATA[:msg.LEN])))
+            rtr = bool(msg.MSGTYPE & PCAN_MESSAGE_RTR)
+            data = b"" if rtr else bytes(msg.DATA[:msg.LEN])
+            out.append(Frame(time.perf_counter(), msg.ID, data,
+                             extended=bool(msg.MSGTYPE & PCAN_MESSAGE_EXTENDED),
+                             rtr=rtr, dlc=int(msg.LEN)))
         return out
 
     def status_text(self) -> str:

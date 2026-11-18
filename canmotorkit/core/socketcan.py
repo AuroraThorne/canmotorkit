@@ -52,21 +52,33 @@ class SocketCanBus(CanBus):
         self.sock: socket.socket | None = None
 
     @staticmethod
-    def pack_frame(can_id: int, data: bytes) -> bytes:
-        if not 0 <= can_id <= 0x7FF:
-            raise ValueError(f"仅支持标准 11 位 CAN ID: 0x{can_id:X}")
+    def pack_frame(can_id: int, data: bytes, extended: bool = False,
+                   rtr: bool = False, dlc: int | None = None) -> bytes:
+        limit = 0x1FFFFFFF if extended else 0x7FF
+        if not 0 <= can_id <= limit:
+            raise ValueError(f"CAN ID 超出范围: 0x{can_id:X}")
         if len(data) > 8:
             raise ValueError("经典 CAN 数据长度不能超过 8 字节")
-        return CAN_FRAME.pack(can_id, len(data), bytes(data).ljust(8, b"\x00"))
+        frame_id = can_id | (CAN_EFF_FLAG if extended else 0)
+        if rtr:
+            frame_id |= CAN_RTR_FLAG
+        wire_dlc = len(data) if dlc is None else dlc
+        if not 0 <= wire_dlc <= 8:
+            raise ValueError("DLC 必须在 0~8 之间")
+        return CAN_FRAME.pack(frame_id, wire_dlc, bytes(data).ljust(8, b"\x00"))
 
     @staticmethod
-    def unpack_frame(raw: bytes) -> tuple[int, bytes] | None:
+    def unpack_frame(raw: bytes, with_flags: bool = False):
         if len(raw) < CAN_MTU:
             return None
         can_id, dlc, data = CAN_FRAME.unpack(raw[:CAN_MTU])
-        if can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG):
+        if can_id & CAN_ERR_FLAG:
             return None
-        return can_id, data[:min(dlc, 8)]
+        extended = bool(can_id & CAN_EFF_FLAG)
+        rtr = bool(can_id & CAN_RTR_FLAG)
+        can_id &= ~(CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG)
+        result = can_id, data[:min(dlc, 8)] if not rtr else b"", extended, rtr, int(dlc)
+        return result if with_flags else result[:2]
 
     def open(self) -> None:
         if not hasattr(socket, "AF_CAN"):
@@ -94,11 +106,12 @@ class SocketCanBus(CanBus):
             self.sock.close()
             self.sock = None
 
-    def send(self, can_id: int, data: bytes) -> None:
+    def send(self, can_id: int, data: bytes, extended: bool = False,
+             rtr: bool = False, dlc: int | None = None) -> None:
         if self.sock is None:
             raise BusError("SocketCAN 尚未打开")
         try:
-            n = self.sock.send(self.pack_frame(can_id, data))
+            n = self.sock.send(self.pack_frame(can_id, data, extended, rtr, dlc))
         except OSError as e:
             raise BusError(f"SocketCAN 发送失败: {e}") from e
         if n != CAN_MTU:
@@ -117,11 +130,12 @@ class SocketCanBus(CanBus):
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     break
                 raise BusError(f"SocketCAN 接收失败: {e}") from e
-            decoded = self.unpack_frame(raw)
+            decoded = self.unpack_frame(raw, with_flags=True)
             if decoded is None:
                 continue
-            can_id, data = decoded
-            out.append(Frame(time.perf_counter(), can_id, data))
+            can_id, data, extended, rtr, dlc = decoded
+            out.append(Frame(time.perf_counter(), can_id, data,
+                             extended=extended, rtr=rtr, dlc=dlc))
         return out
 
     def status_text(self) -> str:

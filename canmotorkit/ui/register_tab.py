@@ -20,7 +20,6 @@ C_RID, C_NAME, C_SRC, C_TYPE, C_VAL, C_NEW, C_RESP, C_DESC = range(8)
 HEAD = ["RID", "名称", "来源", "类型", "当前值", "新值（双击编辑）", "实测", "说明"]
 TYPE_TXT = {"f": "float", "u": "uint32", "i": "int32"}
 MODIFIED = QColor("#fff3c4")
-SRC_COLOR = {"both": None, "dm": QColor("#e3f2fd"), "hm": QColor("#f3e5f5")}
 
 
 def fmt(typ: str, v) -> str:
@@ -37,6 +36,8 @@ class RegisterTab(QWidget):
         self.worker = None
         self.driver = None
         self.blocked = False
+        self._dark = True
+        self._lim_warning = False
         self.values: dict[int, float | int] = {}
         self._row_of = {r.rid: i for i, r in enumerate(P.REGISTERS)}
         self._pending_id_change: dict[int, int] = {}
@@ -71,10 +72,6 @@ class RegisterTab(QWidget):
                 it = QTableWidgetItem(text)
                 if c != C_NEW or r.ro:
                     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                if r.ro and c == C_NEW:
-                    it.setBackground(QBrush(QColor("#eeeeee")))
-                if c == C_SRC and SRC_COLOR[r.src] is not None:
-                    it.setBackground(QBrush(SRC_COLOR[r.src]))
                 self.table.setItem(i, c, it)
 
         self.chk_family = CheckBox("只显示当前型号家族的寄存器")
@@ -96,11 +93,11 @@ class RegisterTab(QWidget):
         bar.addStretch(1)
         bar.addWidget(self.chk_family)
         note = QLabel("写入立即生效但不存储（达妙文档），需「保存到 Flash」才掉电保持；HM 是否一致待实测。"
-                      "控制模式、波特率、标定值等在本软件中只读。蓝色=仅达妙，紫色=仅 HM。")
+                      "控制模式、波特率、标定值等在本软件中只读。")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#d6b06a")
+        note.setProperty("themeRole", "note")
         self.lbl = QLabel()
-        self.lbl.setStyleSheet("color:#aaaaaa")
+        self.lbl.setProperty("themeRole", "muted")
         self.reg_box = QWidget()
         rl = QVBoxLayout(self.reg_box)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -109,7 +106,8 @@ class RegisterTab(QWidget):
         rl.addWidget(self.table, 1)
         rl.addWidget(self.lbl)
         self.lbl_noreg = QLabel("当前协议不支持参数读写（大疆电调的参数需使用 RoboMaster Assistant）。")
-        self.lbl_noreg.setStyleSheet("color:#aaaaaa;padding:20px")
+        self.lbl_noreg.setProperty("themeRole", "muted")
+        self.lbl_noreg.setStyleSheet("padding:20px")
 
         lay = QVBoxLayout(self)
         lay.addWidget(cg)
@@ -132,6 +130,30 @@ class RegisterTab(QWidget):
     def set_bound(self, worker):
         self.worker = worker
         self.set_driver(None)
+
+    def apply_theme(self, dark: bool):
+        """更新参数表中依赖主题的单元格背景和前景色。"""
+        self._dark = bool(dark)
+        fg = QColor("#f1f1f1" if dark else "#202020")
+        readonly_bg = QColor("#303030" if dark else "#eeeeee")
+        modified_bg = QColor("#6b5517" if dark else "#fff3c4")
+        for row, reg in enumerate(P.REGISTERS):
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                if item is None:
+                    continue
+                item.setForeground(QBrush(fg))
+                item.setBackground(QBrush())
+                if column == C_NEW and reg.ro:
+                    item.setBackground(QBrush(readonly_bg))
+                elif column == C_NEW and item.text().strip():
+                    item.setBackground(QBrush(modified_bg))
+                if column == C_RESP:
+                    if item.text() == "有应答":
+                        item.setForeground(QBrush(QColor("#66bb6a" if dark else "#2e7d32")))
+                    elif item.text() == "无应答":
+                        item.setForeground(QBrush(QColor("#ef5350" if dark else "#c62828")))
+        self._refresh_limit_style()
 
     def set_driver(self, d):
         self.driver = d
@@ -173,7 +195,13 @@ class RegisterTab(QWidget):
         src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
         self.lbl_lim.setText(f"p ±{lim.p_max:.7g} rad，v ±{lim.v_max:.7g} rad/s，t ±{lim.t_max:.7g} Nm，"
                              f"kp 0~{lim.kp_max:g}，kd 0~{lim.kd_max:g}（{src}）")
-        self.lbl_lim.setStyleSheet("" if from_motor else "color:#c62828")
+        self._lim_warning = not from_motor
+        self._refresh_limit_style()
+
+    def _refresh_limit_style(self):
+        self.lbl_lim.setStyleSheet(
+            f"color:{'#ef5350' if self._dark else '#c62828'}" if self._lim_warning else ""
+        )
 
     def on_state(self, s: dict):
         b = s["blocked"]
@@ -219,14 +247,14 @@ class RegisterTab(QWidget):
         if err:
             if "超时" in err:
                 resp.setText("无应答")
-                resp.setForeground(QBrush(QColor("#c62828")))
+                resp.setForeground(QBrush(QColor("#ef5350" if self._dark else "#c62828")))
             self.table.blockSignals(False)
             self.lbl.setText(f"✖ {kind} 0x{rid:02X} {reg.name}：{err}")
             if kind == "write":
                 self._pending_id_change.pop(rid, None)
             return
         resp.setText("有应答")
-        resp.setForeground(QBrush(QColor("#2e7d32")))
+        resp.setForeground(QBrush(QColor("#66bb6a" if self._dark else "#2e7d32")))
         self.values[rid] = value
         self.table.item(row, C_VAL).setText(fmt(reg.typ, value))
         if kind == "write":
@@ -245,7 +273,8 @@ class RegisterTab(QWidget):
 
     def _on_item_changed(self, it: QTableWidgetItem):
         if it.column() == C_NEW:
-            it.setBackground(QBrush(MODIFIED) if it.text().strip() else QBrush())
+            color = QColor("#6b5517" if self._dark else MODIFIED.name())
+            it.setBackground(QBrush(color) if it.text().strip() else QBrush())
 
     def _read_sel(self):
         for r in sorted({i.row() for i in self.table.selectedIndexes()}):

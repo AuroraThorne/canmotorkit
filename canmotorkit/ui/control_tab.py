@@ -1,17 +1,25 @@
 """控制页：电流/扭矩（主页）+ MIT（子页，仅 MIT 电机）+ 实时反馈。
 
-约定：参数默认全 0；修改后黄色标记，必须点“应用”或回车才下发；单位按厂家协议。
+约定：参数默认全 0；修改后必须点“应用”或回车才下发；单位按厂家协议。
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QPushButton, QSlider, QTabWidget, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QWidget, QSizePolicy)
 
 from canmotorkit.drivers import dm_protocol as P
 
-PENDING_STYLE = "QDoubleSpinBox{background:#d6a936;color:#171717}"
+
+
+def _spin_style(dark: bool) -> str:
+    """让目标值框使用与置零按钮一致的底色，并保留禁用态对比度。"""
+    if dark:
+        return ("QDoubleSpinBox{background:#3a3a3a;color:#f1f1f1;}"
+                "QDoubleSpinBox:disabled{background:#292929;color:#777777;}")
+    return ("QDoubleSpinBox{background:#e2e2e2;color:#202020;}"
+            "QDoubleSpinBox:disabled{background:#eeeeee;color:#777777;}")
 
 
 class _Row:
@@ -19,7 +27,7 @@ class _Row:
     STEPS = 2000
 
     def __init__(self, grid: QGridLayout, row: int, label: str, unit: str, decimals: int,
-                 step: float, on_edit, on_enter):
+                 step: float, on_edit, on_enter, place_spin=True):
         self.lo, self.hi = -1.0, 1.0
         self.applied = 0.0
         self.on_edit = on_edit
@@ -31,21 +39,20 @@ class _Row:
         self.spin.setSingleStep(step)
         self.spin.setKeyboardTracking(True)
         self.spin.setMinimumWidth(110)
+        self.spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.spin.setStyleSheet(_spin_style(True))
+        self.slider.setMinimumWidth(0)
         self.spin.setSuffix(f" {unit}" if unit else "")
         self.btn0 = QToolButton()
         self.btn0.setText("0")
         self.btn0.setFocusPolicy(Qt.NoFocus)
-        self.range_lbl = QLabel()
-        self.range_lbl.setStyleSheet("color:#aaaaaa")
         grid.addWidget(QLabel(label), row, 0)
         grid.addWidget(self.slider, row, 1)
-        grid.addWidget(self.spin, row, 2)
-        grid.addWidget(self.btn0, row, 3)
-        grid.addWidget(self.range_lbl, row, 4)
+        if place_spin:
+            grid.addWidget(self.spin, row, 2)
         self.slider.valueChanged.connect(self._on_slider)
         self.spin.valueChanged.connect(self._on_spin)
         self.spin.lineEdit().returnPressed.connect(on_enter)
-        self.btn0.clicked.connect(lambda: self.set_value(0.0))
 
     def set_range(self, lo: float, hi: float):
         v = self.value()
@@ -53,7 +60,6 @@ class _Row:
         self.spin.blockSignals(True)
         self.spin.setRange(lo, hi)
         self.spin.blockSignals(False)
-        self.range_lbl.setText(f"[{lo:.7g}, {hi:.7g}]")
         self.set_value(v)
 
     def value(self) -> float:
@@ -77,8 +83,10 @@ class _Row:
         return abs(self.value() - self.applied) > 1e-12
 
     def _mark(self):
-        self.spin.setStyleSheet(PENDING_STYLE if self.pending() else "")
         self.on_edit()
+
+    def apply_theme(self, dark: bool):
+        self.spin.setStyleSheet(_spin_style(dark))
 
     def _to_slider(self, v: float) -> int:
         span = self.hi - self.lo
@@ -99,82 +107,116 @@ class _Row:
 
 
 class _Params(QWidget):
-    """一组参数行 + 应用/撤销/全部置0。"""
+    """一组参数行 + 应用/置零。"""
 
     def __init__(self, specs, on_apply):
         super().__init__()
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.on_apply = on_apply
+        self._bound = False
+        self._output_enabled = False
         self.rows = {}
         grid = QGridLayout(self)
         grid.setColumnStretch(1, 1)
+        single_output = len(specs) == 1
         for i, (k, label, unit, dec, step) in enumerate(specs):
-            self.rows[k] = _Row(grid, i, label, unit, dec, step, self._edited, self.apply)
+            self.rows[k] = _Row(grid, i, label, unit, dec, step, self._edited, self.apply,
+                                place_spin=not single_output)
+        for row in self.rows.values():
+            row.btn0.clicked.connect(lambda _checked=False, target=row: self._zero_row(target))
         n = len(specs)
-        self.btn_apply = QPushButton("应用（回车）")
-        self.btn_apply.setStyleSheet("QPushButton:enabled{font-weight:bold;background:#d6a936;color:#171717}")
-        self.btn_revert = QPushButton("撤销修改")
-        self.btn_all0 = QPushButton("全部置 0")
-        self.btn_all0.setToolTip("只修改界面值，仍需应用")
-        for b in (self.btn_apply, self.btn_revert, self.btn_all0):
-            b.setFocusPolicy(Qt.NoFocus)
+        self.btn_apply = QPushButton("应用")
+        self.btn_apply.setStyleSheet("QPushButton:enabled{font-weight:bold}")
+        self.btn_apply.setFocusPolicy(Qt.NoFocus)
+        self.btn_apply.setFixedHeight(28)
         r = QHBoxLayout()
         r.addWidget(self.btn_apply)
-        r.addWidget(self.btn_revert)
+        if single_output:
+            # 单输出页的置零操作与应用放在同一行，避免挤压输出数值框。
+            output_row = next(iter(self.rows.values()))
+            output_row.spin.setFixedWidth(110)
+            output_row.spin.setFixedHeight(28)
+            output_row.spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            output_row.btn0.setFixedHeight(28)
+            r.addWidget(output_row.spin)
+            r.addWidget(output_row.btn0)
+        else:
+            for row_index, row in enumerate(self.rows.values()):
+                grid.addWidget(row.btn0, row_index, 3)
         r.addStretch(1)
-        r.addWidget(self.btn_all0)
-        grid.addLayout(r, n, 0, 1, 5)
-        self.lbl_applied = QLabel()
-        self.lbl_applied.setStyleSheet("color:#aaaaaa;font-family:Consolas,monospace")
-        grid.addWidget(self.lbl_applied, n + 1, 0, 1, 5)
+        grid.addLayout(r, n, 0, 1, 4 if not single_output else 3)
         self.btn_apply.clicked.connect(self.apply)
-        self.btn_revert.clicked.connect(lambda: [x.set_value(x.applied) for x in self.rows.values()])
-        self.btn_all0.clicked.connect(lambda: [x.set_value(0.0) for x in self.rows.values()])
-        self._show()
+        self._edited()
 
     def applied(self) -> dict:
         return {k: r.applied for k, r in self.rows.items()}
 
     def apply(self):
+        if not self._bound or not self._output_enabled:
+            return
         for r in self.rows.values():
             r.mark_applied()
-        self._show()
         self.on_apply(self.applied())
+
+    def _zero_row(self, row: _Row):
+        """把指定参数置零，并在输出中时立即下发零指令。"""
+        row.set_value(0.0)
+        if self._bound and self._output_enabled:
+            self.apply()
 
     def reset_zero(self):
         for r in self.rows.values():
             r.set_value(0.0)
             r.mark_applied()
-        self._show()
+
+    def set_enabled(self, enabled: bool):
+        """未绑定电机时锁定整组输出控件，避免修改无效参数。"""
+        self._bound = bool(enabled)
+        self._output_enabled = False
+        for row in self.rows.values():
+            row.slider.setEnabled(enabled)
+            row.spin.setEnabled(enabled)
+            row.btn0.setEnabled(enabled and self._output_enabled)
+        self._edited()
+
+    def set_output_enabled(self, enabled: bool):
+        """只有电机已使能/开始输出时才允许下发参数。"""
+        self._output_enabled = bool(enabled)
+        for row in self.rows.values():
+            row.btn0.setEnabled(self._bound and self._output_enabled)
+        self._edited()
 
     def _edited(self):
         if not hasattr(self, "btn_apply"):
             return
-        pend = any(r.pending() for r in self.rows.values())
-        self.btn_apply.setEnabled(pend)
-        self.btn_revert.setEnabled(pend)
+        self.btn_apply.setEnabled(self._bound and self._output_enabled)
 
-    def _show(self):
-        a = self.applied()
-        self.lbl_applied.setText("已应用：" + "  ".join(f"{k}={v:.6g}" for k, v in a.items()))
-        self._edited()
+    def apply_theme(self, dark: bool):
+        for row in self.rows.values():
+            row.apply_theme(dark)
 
 
 class ControlPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.worker = None
         self.driver = None
         self._safety_out_max = None
+        self._dark = True
+        self._lim_warning = False
+        self._code_fault = False
+        self._active = False
 
         # 电流/扭矩主页
         self.cur = _Params([("out", "输出", "", 3, 0.05)], self._apply_cur)
-        self.lbl_cur_hint = QLabel()
-        self.lbl_cur_hint.setWordWrap(True)
-        self.lbl_cur_hint.setStyleSheet("color:#d6b06a")
         pc = QWidget()
+        pc.setMinimumWidth(0)
+        pc.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         lc = QVBoxLayout(pc)
         lc.addWidget(self.cur)
-        lc.addWidget(self.lbl_cur_hint)
         lc.addStretch(1)
 
         # MIT 子页
@@ -184,6 +226,8 @@ class ControlPanel(QWidget):
         self.lbl_lim = QLabel("—")
         self.lbl_lim.setWordWrap(True)
         pm = QWidget()
+        pm.setMinimumWidth(0)
+        pm.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         lm = QVBoxLayout(pm)
         lm.addWidget(self.mit)
         f = QFormLayout()
@@ -191,7 +235,7 @@ class ControlPanel(QWidget):
         lm.addLayout(f)
         tip = QLabel("MIT 模式下，前馈扭矩 t 同样受左侧「电流/扭矩限幅」限制；位置/速度环由驱动器完成。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#aaaaaa")
+        tip.setProperty("themeRole", "muted")
         lm.addWidget(tip)
         lm.addStretch(1)
 
@@ -201,16 +245,25 @@ class ControlPanel(QWidget):
         self.tabs.currentChanged.connect(self._tab_changed)
 
         rg = QGroupBox("实时反馈")
+        rg.setMinimumWidth(0)
+        rg.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         rf = QFormLayout(rg)
+        rf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         mono = "font-family:Consolas,monospace;font-size:13px"
         self.lbl = {}
-        for k, name in (("pos", "位置（原始 / 累计）"), ("vel", "速度"), ("out", "输出（指令 / 反馈）"),
-                        ("tmp", "温度"), ("code", "状态码"), ("raw", "原始字节")):
+        self._feedback_rows = {}
+        for k, name in (("pos_raw", "原始位置"), ("pos_mt", "累计位置"),
+                        ("vel", "速度"), ("out", "输出（指令 / 反馈）"),
+                        ("tmp", "温度"), ("code", "状态码")):
+            title = QLabel(name)
             lb = QLabel("—")
+            lb.setMinimumWidth(0)
+            lb.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lb.setStyleSheet(mono)
             lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.lbl[k] = lb
-            rf.addRow(name, lb)
+            self._feedback_rows[k] = (title, lb)
+            rf.addRow(title, lb)
 
         lay = QVBoxLayout(self)
         lay.addWidget(self.tabs)
@@ -223,30 +276,61 @@ class ControlPanel(QWidget):
         self.worker = worker
         self.set_driver(None)
 
+    def apply_theme(self, dark: bool):
+        self._dark = bool(dark)
+        self.cur.apply_theme(self._dark)
+        self.mit.apply_theme(self._dark)
+        self._refresh_limit_style()
+        self._refresh_code_style()
+
     def set_driver(self, d):
         self.driver = d
         self._safety_out_max = None
+        self._active = False
         self.cur.reset_zero()
         self.mit.reset_zero()
         has_mit = d is not None and d.caps.mit
+        bound = d is not None and self.worker is not None
+        self.cur.set_enabled(bound)
+        self.mit.set_enabled(bound and has_mit)
         self.tabs.setTabEnabled(1, has_mit)
         self.tabs.setTabToolTip(1, "" if has_mit else "当前电机不支持 MIT 协议")
         if not has_mit:
             self.tabs.setCurrentIndex(0)
         if d is None:
-            self.lbl_cur_hint.setText("")
+            self.cur.rows["out"].spin.setSuffix("")
+            self.lbl_lim.setText("—")
+            self._lim_warning = False
+            self._refresh_limit_style()
+            self.tabs.setCurrentIndex(0)
             for lb in self.lbl.values():
-                lb.setText("—")
+                lb.setText("")
+            self._update_feedback_rows()
             return
         r = self.cur.rows["out"]
         r.spin.setSuffix(f" {d.out_unit}")
         self._update_output_range()
-        if d.caps.mit:
-            self.lbl_cur_hint.setText("达妙/HM 的电流模式即 MIT kp=kd=p=v=0、t=输出（Nm）。"
-                                      "空载时超过静摩擦会持续加速。")
-        else:
-            self.lbl_cur_hint.setText(f"大疆电调电流指令，单位 A（厂家比例 ±{d.m.raw_max} ↔ ±{d.out_max:g} A）。")
         self._tab_changed(self.tabs.currentIndex())
+        self._update_feedback_rows()
+
+    def on_state(self, s: dict):
+        """同步 Worker 的实际输出状态，控制参数下发权限。"""
+        active = bool(s.get("active", False))
+        if self._active and not active:
+            # 停止输出后清掉界面和后台目标，重新使能必须从零开始。
+            self.cur.reset_zero()
+            self.mit.reset_zero()
+            if self.worker is not None:
+                self.worker.set_target_out(0.0)
+        self._active = active
+        self.cur.set_output_enabled(self._active)
+        self.mit.set_output_enabled(self._active)
+
+    def _update_feedback_rows(self):
+        has_status = self.driver is not None and self.driver.caps.status_code
+        title, value = self._feedback_rows["code"]
+        title.setVisible(has_status)
+        value.setVisible(has_status)
 
     def set_limits(self, lim: P.Limits, from_motor: bool):
         r = self.mit.rows
@@ -260,7 +344,8 @@ class ControlPanel(QWidget):
         src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
         self.lbl_lim.setText(f"p ±{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
                              f"kp 0~{lim.kp_max:g}  kd 0~{lim.kd_max:g}（{src}）")
-        self.lbl_lim.setStyleSheet("" if from_motor else "color:#c62828")
+        self._lim_warning = not from_motor
+        self._refresh_limit_style()
 
     def set_output_limit(self, limit: float | None):
         """同步左侧安全限幅，控制滑条只能在当前允许范围内调整。"""
@@ -282,8 +367,9 @@ class ControlPanel(QWidget):
         if d is None:
             return
         fb = s.fb
-        self.lbl["pos"].setText(f"{fb.pos:+9.4f} / {s.pos_mt:+10.4f} rad")
-        self.lbl["vel"].setText(f"{fb.vel:+9.3f} rad/s")
+        self.lbl["pos_raw"].setText(f"{fb.pos:+.4f} rad")
+        self.lbl["pos_mt"].setText(f"{s.pos_mt:+.4f} rad")
+        self.lbl["vel"].setText(f"{fb.vel:+.3f} rad/s")
         cmd = "—" if s.out != s.out else f"{s.out:+.3f}"
         self.lbl["out"].setText(f"{cmd} / {fb.out:+.3f} {d.out_unit}")
         t2 = "" if fb.temp2 != fb.temp2 else f" / {fb.temp2:.0f}"
@@ -291,18 +377,34 @@ class ControlPanel(QWidget):
         if d.caps.status_code:
             fault = d.is_fault(fb.code)
             self.lbl["code"].setText(f"{fb.code}  {d.code_text(fb.code)}")
-            self.lbl["code"].setStyleSheet("color:#c62828;font-weight:bold" if fault else "")
+            self._code_fault = fault
+            self._refresh_code_style()
         else:
-            self.lbl["code"].setText("（协议无状态码）")
-        self.lbl["raw"].setText(P.hexdata(fb.raw))
+            self.lbl["code"].setText("")
+            self._code_fault = False
+            self._refresh_code_style()
 
     def to_current(self):
         self.tabs.setCurrentIndex(0)
 
+    def _refresh_limit_style(self):
+        self.lbl_lim.setStyleSheet(
+            f"color:{'#ef5350' if self._dark else '#c62828'}" if self._lim_warning else ""
+        )
+
+    def _refresh_code_style(self):
+        self.lbl["code"].setStyleSheet(
+            f"color:{'#ef5350' if self._dark else '#c62828'};font-weight:bold"
+            if self._code_fault else ""
+        )
+
     # ---------- 内部 ----------
     def _apply_cur(self, a: dict):
         if self.worker:
-            self.worker.set_target_out(a["out"])
+            if a["out"] == 0.0:
+                self.worker.zero_output()
+            else:
+                self.worker.set_target_out(a["out"])
 
     def _apply_mit(self, a: dict):
         if self.worker:

@@ -24,6 +24,7 @@ class _FillHeader(QHeaderView):
         super().__init__(Qt.Horizontal, parent)
         self._ready = False
         self._adjusting = False
+        self._last_width = 0
         self.setSectionsMovable(False)
         self.setStretchLastSection(False)
         self.setMinimumSectionSize(min(self.MIN_WIDTHS))
@@ -35,15 +36,15 @@ class _FillHeader(QHeaderView):
             return False
         total_min = sum(self.MIN_WIDTHS)
         if width >= total_min:
-            first = max(self.MIN_WIDTHS[0], int(width * 0.50))
-            second = max(self.MIN_WIDTHS[1], int(width * 0.20))
+            first = max(self.MIN_WIDTHS[0], int(width / 3))
+            second = max(self.MIN_WIDTHS[1], int(width * 11 / 30))
             third = max(self.MIN_WIDTHS[2], width - first - second)
             if first + second + third > width:
                 first = width - second - third
         else:
             # 极窄窗口下优先保证三列仍然存在，不让表格产生横向滚动条。
-            first = max(45, int(width * 0.50))
-            second = max(35, int(width * 0.20))
+            first = max(45, int(width / 3))
+            second = max(35, int(width * 11 / 30))
             third = max(45, width - first - second)
             first = max(45, width - second - third)
         self._adjusting = True
@@ -51,13 +52,17 @@ class _FillHeader(QHeaderView):
             self.resizeSection(index, size)
         self._adjusting = False
         self._ready = True
+        self._last_width = width
         self._fill_to_width()
         return True
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._ready and not self._adjusting:
-            self._fill_to_width()
+            width = self.width()
+            if width != self._last_width:
+                self._resize_proportionally(width)
+                self._last_width = width
 
     def _fill_to_width(self):
         target = self.width()
@@ -77,6 +82,51 @@ class _FillHeader(QHeaderView):
                 delta -= reduced - size
                 if delta == 0:
                     break
+        self._adjusting = False
+
+    def _resize_proportionally(self, target: int):
+        """表格整体变化时让三列一起缩放，避免只有末列变化。"""
+        sizes = [self.sectionSize(i) for i in range(self.count())]
+        total = sum(sizes)
+        if total <= 0 or target <= 0:
+            return
+        minimums = list(self.MIN_WIDTHS)
+        if target < sum(minimums):
+            # 极窄情况下仍交给原有逻辑处理，优先保证表格不溢出。
+            self._fill_to_width()
+            return
+
+        # 先按当前比例分配，再把低于最小宽度的列固定住，将剩余空间
+        # 继续按比例分给其它列。
+        result = [0] * self.count()
+        remaining_indices = set(range(self.count()))
+        remaining_target = target
+        remaining_weight = float(total)
+        while remaining_indices:
+            fixed = False
+            for index in tuple(remaining_indices):
+                proposed = round(remaining_target * sizes[index] / remaining_weight)
+                if proposed < minimums[index]:
+                    result[index] = minimums[index]
+                    remaining_target -= result[index]
+                    remaining_weight -= sizes[index]
+                    remaining_indices.remove(index)
+                    fixed = True
+            if not fixed:
+                for index in remaining_indices:
+                    result[index] = round(remaining_target * sizes[index] / remaining_weight)
+                break
+
+        # 舍入可能产生 1~2 px 误差，补到最后一个可调整列。
+        delta = target - sum(result)
+        if delta:
+            for index in reversed(range(self.count())):
+                if result[index] + delta >= minimums[index]:
+                    result[index] += delta
+                    break
+        self._adjusting = True
+        for index, size in enumerate(result):
+            self.resizeSection(index, size)
         self._adjusting = False
 
     def _on_section_resized(self, index, old_size, new_size):
@@ -115,17 +165,16 @@ class MotorListPanel(QGroupBox):
         super().__init__("② 总线电机", parent)
         self.worker = None
         self.entries: list[dict] = []
+        self._debug_row: int | None = None
+        self._temporary_row: int | None = None
         self.btn_scan = QPushButton("扫描总线")
         self.btn_scan.setToolTip("先监听大疆广播反馈，再用 0x7FF/0xCC 逐个查询达妙/HM，\n"
                                  "并读 CTRL_MODE / v_bus 区分达妙与 HM。需在失能状态下进行。")
         self.sp_to = QSpinBox()
         self.sp_to.setRange(1, 127)
         self.sp_to.setValue(40)
-        self.sp_to.setPrefix("达妙/HM ID 1~")
+        self.sp_to.setPrefix("达妙 ID 1~")
         self.sp_to.setToolTip("达妙/HM 使用 1~127 的 ID 查询范围；大疆不需要设置 ID，会自动监听反馈广播")
-        self.lbl_dji_scan = QLabel("大疆：自动监听")
-        self.lbl_dji_scan.setStyleSheet("color:#aaaaaa")
-        self.lbl_dji_scan.setToolTip("大疆电调主动广播反馈，扫描时自动监听，不需要单独设置扫描 ID")
         self.prog = QProgressBar()
         self.prog.setTextVisible(True)
         self.prog.setFormat("")
@@ -137,29 +186,21 @@ class MotorListPanel(QGroupBox):
         self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.tbl.itemSelectionChanged.connect(self._update_selection_style)
+        self.tbl.itemSelectionChanged.connect(self._selection_changed)
+        self.tbl.cellDoubleClicked.connect(self._double_click)
         hh = self.tbl.horizontalHeader()
         for column in range(3):
             hh.setSectionResizeMode(column, QHeaderView.Interactive)
-        hh.setStyleSheet(
-            "QHeaderView::section{background:#303030;color:#f1f1f1;"
-            "border:1px solid #666666;border-right:2px solid #707070;"
-            "padding:4px 6px;}"
-            "QHeaderView::section:hover{background:#3e3e3e;}"
-        )
-        self.tbl.setStyleSheet(
-            "QTableWidget{gridline-color:#666666;}"
-        )
+        self.apply_theme(True)
         self._columns_initialized = False
         QTimer.singleShot(0, self._set_default_column_widths)
         self.tbl.setMinimumHeight(130)
-        self.btn_use = QPushButton("调试选中电机")
+        self.btn_use = QPushButton("双击选择电机")
         self.btn_use.setStyleSheet("QPushButton:enabled{font-weight:bold}")
 
         top = QHBoxLayout()
         top.addWidget(self.btn_scan)
         top.addWidget(self.sp_to)
-        top.addWidget(self.lbl_dji_scan)
         lay = QVBoxLayout(self)
         lay.addLayout(top)
         lay.addWidget(self.prog)
@@ -169,13 +210,14 @@ class MotorListPanel(QGroupBox):
         lay.addLayout(b)
 
         self.btn_scan.clicked.connect(self.scan_bus)
-        self.btn_use.clicked.connect(self._use)
-        self.tbl.itemDoubleClicked.connect(lambda _: self._use())
+        self.btn_use.clicked.connect(self._action_clicked)
         self.set_bound(None)
 
     # ---------- 外部 ----------
     def set_bound(self, worker):
         self.worker = worker
+        self._debug_row = None
+        self._temporary_row = None
         for w in (self.btn_scan, self.btn_use):
             w.setEnabled(worker is not None)
         if worker is None:
@@ -183,12 +225,30 @@ class MotorListPanel(QGroupBox):
             self.tbl.setRowCount(0)
             self.prog.setValue(0)
             self.prog.setFormat("")
+        self._update_action_button()
+        self._update_selection_style()
+
+    def apply_theme(self, dark: bool):
+        if dark:
+            header = ("QHeaderView::section{background:#303030;color:#f1f1f1;"
+                      "border:1px solid #666666;border-right:2px solid #707070;"
+                      "padding:4px 6px;}QHeaderView::section:hover{background:#3e3e3e;}")
+            grid = "QTableWidget{gridline-color:#666666;}"
+        else:
+            header = ("QHeaderView::section{background:#e1e1e1;color:#202020;"
+                      "border:1px solid #a0a0a0;border-right:2px solid #888888;"
+                      "padding:4px 6px;}QHeaderView::section:hover{background:#d2d2d2;}")
+            grid = "QTableWidget{gridline-color:#b0b0b0;}"
+        self.tbl.horizontalHeader().setStyleSheet(header)
+        self.tbl.setStyleSheet(grid)
+        self._update_selection_style()
 
     def on_state(self, s: dict):
         busy = s["active"] or s["scanning"]
         self.btn_scan.setEnabled(not busy)
-        self.btn_use.setEnabled(not s["active"])
+        self.btn_use.setEnabled(self.worker is not None and not s["active"])
         self.btn_scan.setToolTip("请先失能" if s["active"] else self.btn_scan.toolTip())
+        self._update_action_button()
 
     def on_scan_progress(self, phase: str, i: int, n: int):
         self.prog.setRange(0, max(1, n))
@@ -215,6 +275,7 @@ class MotorListPanel(QGroupBox):
             r = self.tbl.rowCount()
             self.tbl.insertRow(r)
             cb = ArrowOnlyComboBox()
+            cb.set_center_text(True)
             opts = []
             for m, mid in e["candidates"]:
                 p = "dji" if m in dji.MODELS else e["protocol"]
@@ -227,9 +288,18 @@ class MotorListPanel(QGroupBox):
                 opts.remove(selected)
                 opts.insert(0, selected)
             for p, m, mid in opts:
-                cb.addItem(f"{PROTOCOLS[p][0]} · {m}", (p, m, mid))
+                short_model = {
+                    "M3508 (C620)": "M3508/C620",
+                    "M2006 (C610)": "M2006/C610",
+                    "GM6020 (电流模式)": "GM6020",
+                }.get(m, m)
+                cb.addItem(short_model, (p, m, mid))
+                cb.setItemData(cb.count() - 1, f"{PROTOCOLS[p][0]} · {m}", Qt.ToolTipRole)
+            cb.setToolTip(f"{PROTOCOLS[selected[0]][0]} · {selected[1]}")
             cb.currentIndexChanged.connect(lambda _=0, row=r, c=cb: self._model_changed(row, c))
             cb.clicked.connect(lambda row=r: self.tbl.selectRow(row))
+            cb.setProperty("motorRow", r)
+            cb.installEventFilter(self)
             self.tbl.setCellWidget(r, 0, cb)
             fb = e.get("fb_id")
             for c, txt in ((1, str(e["motor_id"])), (2, f"0x{fb:03X}" if fb is not None else "")):
@@ -244,10 +314,16 @@ class MotorListPanel(QGroupBox):
         self._update_selection_style()
 
     def eventFilter(self, watched, event):
-        if event.type() == QEvent.MouseButtonPress:
-            row = watched.property("motorRow")
-            if row is not None:
-                self.tbl.selectRow(int(row))
+        row = watched.property("motorRow")
+        if row is not None:
+            row = int(row)
+            if event.type() == QEvent.MouseButtonDblClick:
+                self._double_click(row, 0)
+                return True
+            if event.type() == QEvent.MouseButtonPress:
+                self.tbl.selectRow(row)
+                self._temporary_row = row
+                self._update_selection_style()
         return super().eventFilter(watched, event)
 
     def _set_default_column_widths(self):
@@ -263,13 +339,54 @@ class MotorListPanel(QGroupBox):
         self.tbl.selectRow(row)
         self._model_pick(row, cb)
 
+    def _double_click(self, row: int, _column: int = 0):
+        self.tbl.selectRow(row)
+        self._temporary_row = row
+        self._update_selection_style()
+        self._use()
+
+    def _selection_changed(self):
+        row = self.tbl.currentRow()
+        self._temporary_row = row if row >= 0 else None
+        self._update_selection_style()
+
+    def set_debug_driver(self, driver):
+        """设置持久的调试行；普通表格选中状态与它分离。"""
+        self._debug_row = None
+        if driver is not None:
+            for row, entry in enumerate(self.entries):
+                if (entry.get("protocol") == driver.protocol
+                        and entry.get("model") == driver.model
+                        and entry.get("motor_id") == driver.motor_id):
+                    self._debug_row = row
+                    break
+            if self._debug_row is None and 0 <= self.tbl.currentRow() < len(self.entries):
+                self._debug_row = self.tbl.currentRow()
+        self.clear_temporary_selection()
+        self._update_action_button()
+
+    def clear_temporary_selection(self):
+        self.tbl.clearSelection()
+        self.tbl.setCurrentCell(-1, -1)
+        self._temporary_row = None
+        self._update_selection_style()
+
+    def _update_action_button(self):
+        self.btn_use.setText("取消调试" if self._debug_row is not None else "双击选择电机")
+
+    def _action_clicked(self):
+        if self._debug_row is not None:
+            self.motor_selected.emit(None)
+        else:
+            self._use()
+
     def _update_selection_style(self):
-        selected_row = self.tbl.currentRow()
         for row in range(self.tbl.rowCount()):
             cb = self.tbl.cellWidget(row, 0)
             if cb is None:
                 continue
-            if row == selected_row:
+            highlighted = row in (self._debug_row, self._temporary_row)
+            if highlighted:
                 cb.setStyleSheet(
                     "QComboBox{background:#356a9a;color:#ffffff;"
                     "selection-background-color:#356a9a;selection-color:#ffffff;}"
@@ -283,13 +400,12 @@ class MotorListPanel(QGroupBox):
                 field.setStyleSheet(
                     "QLineEdit{background:#356a9a;color:#ffffff;border:1px solid #6ea8d6;"
                     "border-radius:2px;padding:2px 4px;}"
-                    if row == selected_row else
-                    "QLineEdit{background:#202020;color:#f1f1f1;border:1px solid #555555;"
-                    "border-radius:2px;padding:2px 4px;}"
+                    if highlighted else ""
                 )
 
     def _model_pick(self, row: int, cb: QComboBox):
         p, m, mid = cb.currentData()
+        cb.setToolTip(f"{PROTOCOLS[p][0]} · {m}")
         e = self.entries[row]
         e.update(protocol=p, model=m, motor_id=mid)
         if p == "dji":
@@ -315,10 +431,17 @@ class MotorListPanel(QGroupBox):
             cb.setCurrentIndex(0)
             cb.blockSignals(False)
 
+    def _use_row(self, row: int):
+        self.tbl.selectRow(row)
+        self._use()
+
     def _use(self):
         r = self.tbl.currentRow()
         if not (0 <= r < len(self.entries)) or self.worker is None:
             QMessageBox.information(self, "选择电机", "请先在列表中选中一台电机")
+            return
+        if r == self._debug_row:
+            self.motor_selected.emit(None)
             return
         e = self.entries[r]
         try:

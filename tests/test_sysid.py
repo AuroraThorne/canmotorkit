@@ -34,6 +34,7 @@ def test_stepsine_recovers_model():
     assert abs(m.J - 0.01) / 0.01 < 0.1, m
     assert abs(m.b - 0.05) / 0.05 < 0.3, m
     assert 0.001 < m.Td < 0.01
+    assert len(bode.coh) == len(bode.coh_p) == len(bode.f)
     # 位置/电流 = 速度/电流 / ω
     w = 2 * math.pi * bode.f
     assert all(abs(bode.mag_p * w / bode.mag_v - 1) < 0.1)
@@ -59,10 +60,53 @@ def test_step_model_with_friction():
 def test_suggest_and_closed_loop_stable():
     model = sysid.Model(J=0.01, b=0.05, Fc=0.0, Td=0.002)
     s = sysid.suggest(model, latency=0.002, rate_hz=500)
-    assert s.vel_kp > 0 and s.pos_kp > 0 and s.pos_kd > 0
-    for loop, kp, ki, kd, amp in (("vel", s.vel_kp, s.vel_ki, 0.0, 2.0),
-                                  ("pos", s.pos_kp, s.pos_ki, s.pos_kd, 0.5)):
-        run = LoopRun(LoopConfig(loop=loop, kp=kp, ki=ki, kd=kd, amp=amp, duration=2.0, out_max=10))
-        simulate(run, delay_steps=2)
-        st = sysid.loop_stats(run.rec, loop)
-        assert st is not None and st.overshoot < 40 and abs(st.ss_err) < 0.05 * amp, (loop, st)
+    assert s.vel_kp > 0 and s.vel_ki > 0 and s.pos_kp > 0 and s.pos_ki > 0
+    assert "单环位置" not in s.text()
+    vel = LoopRun(LoopConfig(loop="vel", kp=s.vel_kp, ki=s.vel_ki,
+                             amp=2.0, duration=2.0, out_max=10))
+    simulate(vel, delay_steps=2)
+    vel_stats = sysid.loop_stats(vel.rec, "vel")
+    assert vel_stats is not None and vel_stats.overshoot < 40 and abs(vel_stats.ss_err) < 0.1
+
+    pos = LoopRun(LoopConfig(loop="pos", kp=s.vel_kp, ki=s.vel_ki,
+                             pos_kp=s.pos_kp, pos_ki=s.pos_ki, pos_kd=s.pos_kd,
+                             amp=0.5, duration=2.0, out_max=10, pos_out_max=10))
+    simulate(pos, delay_steps=2)
+    pos_stats = sysid.loop_stats(pos.rec, "pos")
+    assert pos_stats is not None and pos_stats.overshoot < 40 and abs(pos_stats.ss_err) < 0.05, pos_stats
+
+
+def test_suggestion_uses_custom_start_ratio():
+    model = sysid.Model(J=0.01, b=0.05, Fc=0.0, Td=0.002)
+    s = sysid.suggest(model, latency=0.002, rate_hz=500, start_ratio=0.75)
+    assert s.start_ratio == 0.75
+    assert "75%" in s.text()
+
+
+def test_suggestion_target_is_closed_loop_bandwidth():
+    model = sysid.Model(J=0.01, b=0.05, Fc=0.0, Td=0.002)
+    s = sysid.suggest(model, latency=0.002, rate_hz=500, vel_bw_hz=5.0)
+    assert 4.5 < s.vel_bw < 5.5, s.vel_bw
+
+
+def test_single_position_suggestion_and_prediction():
+    model = sysid.Model(J=0.01, b=0.05, Fc=0.0, Td=0.002)
+    s = sysid.suggest(model, latency=0.002, rate_hz=500,
+                      vel_bw_hz=5.0, single_pos_bw_hz=2.0)
+    assert s.single_pos_kp > 0
+    assert s.single_pos_ki == 0.0
+    assert s.single_pos_kd >= 0
+    assert 1.8 < s.single_pos_bw < 2.2
+    assert 0 < s.single_pos_phase_margin < 180
+
+    run = LoopRun(LoopConfig(
+        loop="pos_single", kp=s.single_pos_kp, ki=s.single_pos_ki,
+        kd=s.single_pos_kd, amp=0.2, duration=1.0, out_max=10.0,
+    ))
+    simulate(run, delay_steps=2)
+    assert run.legacy_position
+    assert len(run.rec.t) > 10
+
+    curves = sysid.predicted_closed_loop(model, s, latency=0.002, rate_hz=500)
+    assert len(curves) == 4
+    assert all(len(curve) == len(curves[0]) for curve in curves)

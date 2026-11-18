@@ -95,11 +95,14 @@ class PCANBasic:
         r = self.dll.CAN_Read(ch, C.byref(msg), C.byref(ts))
         return r, msg, ts
 
-    def write(self, ch: int, can_id: int, data: bytes, extended: bool = False) -> int:
+    def write(self, ch: int, can_id: int, data: bytes, extended: bool = False,
+              rtr: bool = False, dlc: int | None = None) -> int:
         msg = TPCANMsg()
         msg.ID = can_id
         msg.MSGTYPE = PCAN_MESSAGE_EXTENDED if extended else PCAN_MESSAGE_STANDARD
-        msg.LEN = len(data)
+        if rtr:
+            msg.MSGTYPE |= PCAN_MESSAGE_RTR
+        msg.LEN = len(data) if dlc is None else dlc
         for i, b in enumerate(data[:8]):
             msg.DATA[i] = b
         return self.dll.CAN_Write(ch, C.byref(msg))

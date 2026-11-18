@@ -118,4 +118,10 @@ class DmDriver(Driver):
                 return "保存应答"
             r = P.REG_BY_RID.get(d[3])
             return f"应答 {r.name} = {P.decode_value(r.typ, d[4:8]):.7g}" if r else "应答"
-        return f"状态 {P.code_text(d[0] >> 4)}"
+        st = P.unpack_status(d, self.lim)
+        position_text = f"{st.pos:>8.5f}"
+        speed_text = f"{st.vel:>8.3f}"
+        torque_text = f"{st.torque:>+8.5f}"
+        temperature_text = f", 温度: {st.t_mos:>3d}/{st.t_rotor:>3d} °C"
+        return (f"位置: {position_text} rad, 速度: {speed_text} rad/s, "
+                f"扭矩: {torque_text} Nm{temperature_text}")
