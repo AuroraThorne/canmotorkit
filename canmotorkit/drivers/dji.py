@@ -1,4 +1,4 @@
-"""大疆 RoboMaster 电调驱动（C620/M3508、C610/M2006、GM6020 电流模式）。
+"""大疆 RoboMaster 电调驱动（C620/M3508、C610/M2006、GM6020、RM 6623）。
 
 协议要点（reference/ 下大疆说明书）：
 - 控制：一帧控制 4 台，16 位有符号、高字节在前。本软件只控制选中的一台，同帧其余槽位填 0（会把
@@ -21,13 +21,17 @@ class DjiModel:
     esc: str
     ids: range
     fb_base: int          # 反馈 ID = fb_base + 电机 ID
-    ctrl_lo: int          # ID 1~4 的控制帧 ID
-    ctrl_hi: int          # ID 5~ 的控制帧 ID
+    ctrl_lo: int          # 前 4 个设备的控制帧 ID
+    ctrl_hi: int          # 后 4 个设备的控制帧 ID
     raw_max: int          # 指令原始值上限
-    amp_max: float        # 对应电流 A
+    amp_max: float        # 对应输出单位的上限
     gr: float             # 减速比
     has_temp: bool
     note: str = ""
+    feedback_format: str = "rpm_current_temp"
+    zero_based_id: bool = False
+    out_name: str = "电流"
+    out_unit: str = "A"
 
 
 MODELS: dict[str, DjiModel] = {
@@ -38,6 +42,10 @@ MODELS: dict[str, DjiModel] = {
     "GM6020 (电流模式)": DjiModel("GM6020 (电流模式)", "GM6020", range(1, 8), 0x204, 0x1FE, 0x2FE, 16384,
                                 3.0, 1.0, True,
                                 "需在 RoboMaster Assistant 中打开电流环；反馈电流比例按 ±16384↔±3 A 假定，待核对"),
+    "RM 6623": DjiModel("RM 6623", "6623", range(0, 8), 0x205, 0x1FF, 0x2FF, 5000,
+                        5000.0, 1.0, False,
+                        "6623 电流原始值范围 ±5000；反馈无 RPM/温度字段，设备 ID 0~7",
+                        feedback_format="6623", zero_based_id=True, out_unit="原始值"),
 }
 
 
@@ -50,8 +58,13 @@ class DjiDriver(Driver):
     protocol = "dji"
     protocol_name = "大疆 RoboMaster"
     caps = Caps()
-    out_name = "电流"
-    out_unit = "A"
+    @property
+    def out_name(self) -> str:
+        return self.m.out_name
+
+    @property
+    def out_unit(self) -> str:
+        return self.m.out_unit
 
     def __init__(self, model: str = "M3508 (C620)", motor_id: int = 1):
         m = MODELS[model]
@@ -76,6 +89,10 @@ class DjiDriver(Driver):
     @property
     def ctrl(self) -> tuple[int, int]:
         """(控制帧 ID, 槽位 0~3)"""
+        if self.m.zero_based_id:
+            if self.motor_id < 4:
+                return self.m.ctrl_lo, self.motor_id
+            return self.m.ctrl_hi, self.motor_id - 4
         if self.motor_id <= 4:
             return self.m.ctrl_lo, self.motor_id - 1
         return self.m.ctrl_hi, self.motor_id - 5
@@ -90,6 +107,14 @@ class DjiDriver(Driver):
     def parse(self, can_id: int, data: bytes) -> Feedback | None:
         d = data
         ang = (d[0] << 8) | d[1]
+        if self.m.feedback_format == "6623":
+            # 6623: angle, actual current, commanded current, reserved.
+            cur = _i16(d[2], d[3])
+            rotor = ang / 8192.0 * 2 * math.pi
+            if rotor >= math.pi:
+                rotor -= 2 * math.pi
+            return Feedback(pos=rotor / self.m.gr, vel=float("nan"), out=float(cur),
+                            temp=float("nan"), motor_id=self.motor_id, raw=bytes(d))
         rpm = _i16(d[2], d[3])
         cur = _i16(d[4], d[5])
         rotor = ang / 8192.0 * 2 * math.pi
@@ -116,17 +141,24 @@ class DjiDriver(Driver):
         cid, slot = self.ctrl
         if tx and can_id == cid and len(data) == 8:
             raw = _i16(data[2 * slot], data[2 * slot + 1])
+            if self.m.feedback_format == "6623":
+                return f"下发电流: {raw:+d} 原始值"
             return f"下发电流: {raw / self.m.raw_max * self.m.amp_max:+.3f} A"
         if not tx and can_id == self.fb_id:
             if len(data) < 7:
                 return "反馈（数据长度不足）"
             ang = (data[0] << 8) | data[1]
-            rpm = _i16(data[2], data[3])
-            cur = _i16(data[4], data[5])
             rotor = ang / 8192.0 * 2 * math.pi
             if rotor >= math.pi:
                 rotor -= 2 * math.pi
             pos = rotor / self.m.gr
+            if self.m.feedback_format == "6623":
+                actual = _i16(data[2], data[3])
+                command = _i16(data[4], data[5])
+                return (f"位置: {pos:>8.5f} rad, 速度: —, "
+                        f"电流: {actual:>+6d} 原始值, 指令: {command:>+6d} 原始值")
+            rpm = _i16(data[2], data[3])
+            cur = _i16(data[4], data[5])
             current = cur / self.m.raw_max * self.m.amp_max
             position_text = f"{pos:>8.5f}"
             speed_text = f"{rpm:>5d}"
@@ -138,7 +170,7 @@ class DjiDriver(Driver):
 
 
 def guess_models(fb_id: int, data: bytes) -> list[tuple[str, int]]:
-    """根据反馈帧 ID 猜测可能的 (型号, 电机 ID)；0x205~0x208 两类重叠。"""
+    """根据反馈帧 ID 猜测可能的 (型号, 设备 ID)。多个 DJI 型号的 ID 会重叠。"""
     out = []
     for m in MODELS.values():
         mid = fb_id - m.fb_base

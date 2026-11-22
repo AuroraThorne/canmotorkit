@@ -1,14 +1,19 @@
 """达妙 / HM 关节电机驱动（MIT 控制帧 + 0x7FF 参数读写）。"""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from . import dm_protocol as P
 from .base import Caps, Driver, Feedback, Frames
 
-# 型号 -> (寄存器家族, 说明)
+# 型号 -> (寄存器家族, 说明, 是否支持通过 CAN 读取参数)
 MODELS = {
-    "HM9816G9": ("hm", "HM 关节电机，对标达妙 J8009P"),
-    "DM-J8009P": ("dm", "达妙 J8009P-2EC"),
-    "达妙/HM 通用": ("both", "型号未知，按协议族通用处理"),
+    "HM9816G9": ("hm", "HM 关节电机，对标达妙 J8009P", True),
+    "DM-J8009P": ("dm", "达妙 J8009P-2EC", True),
+    "DM-J4340-2EC": ("dm", "达妙 J4340-2EC 减速电机", True),
+    "DM-J4310-2EC": ("dm", "达妙 J4310-2EC 减速电机", True),
+    "DM-J6006-2EC": ("dm", "达妙 J6006-2EC 减速电机", False),
+    "达妙/HM 通用": ("both", "型号未知，按协议族通用处理", True),
 }
 
 
@@ -22,14 +27,22 @@ class DmDriver(Driver):
     def __init__(self, model: str = "HM9816G9", motor_id: int = 1, master_id: int = 0):
         super().__init__(model, motor_id)
         self.master_id = master_id
-        self.family = MODELS.get(model, ("both", ""))[0]
-        self.note = MODELS.get(model, ("", ""))[1]
+        info = MODELS.get(model, ("both", "", True))
+        self.family = info[0]
+        self.note = info[1]
+        self.can_registers = bool(info[2])
+        # J6006 的 MIT/反馈协议可用，但没有确认 CAN 参数读写协议。
+        self.caps = replace(type(self).caps, registers=self.can_registers)
         self.lim = P.DEFAULT_LIMITS
-        self.limits_ok = False
+        self.limits_ok = not self.can_registers
 
     @property
     def ready(self) -> bool:
         return self.limits_ok
+
+    @property
+    def limits_from_motor(self) -> bool:
+        return self.can_registers and self.limits_ok
 
     @property
     def out_max(self) -> float:
@@ -48,7 +61,7 @@ class DmDriver(Driver):
 
     def invalidate_limits(self):
         self.lim = P.DEFAULT_LIMITS
-        self.limits_ok = False
+        self.limits_ok = not self.can_registers
 
     # ---- 解析 ----
     def is_config_reply(self, data: bytes, motor_id: int | None = None) -> bool:

@@ -120,6 +120,7 @@ class MotorCard(QFrame):
         if d is None:
             return
         self._active = bool(s["active"])
+        self.btn_en.setEnabled(not (d.protocol == "gd" and s.get("gd_busy")))
         code = s["code"]
         if s["scanning"]:
             txt, st = "扫描中", "background:#90caf9;color:#102a43"

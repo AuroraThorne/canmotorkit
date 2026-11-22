@@ -44,6 +44,7 @@ class Feedback:
 
 class Driver:
     protocol = ""
+    extended = False          # 驱动使用标准帧还是扩展帧
     protocol_name = ""
     caps = Caps()
     out_name = "扭矩"

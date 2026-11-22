@@ -168,13 +168,12 @@ class MotorListPanel(QGroupBox):
         self._debug_row: int | None = None
         self._temporary_row: int | None = None
         self.btn_scan = QPushButton("扫描总线")
-        self.btn_scan.setToolTip("先监听大疆广播反馈，再用 0x7FF/0xCC 逐个查询达妙/HM，\n"
-                                 "并读 CTRL_MODE / v_bus 区分达妙与 HM。需在失能状态下进行。")
+        self.btn_scan.setToolTip("监听大疆广播，查询达妙/HM 和高擎 GD 状态。需在停止输出时进行。")
         self.sp_to = QSpinBox()
         self.sp_to.setRange(1, 127)
         self.sp_to.setValue(40)
-        self.sp_to.setPrefix("达妙 ID 1~")
-        self.sp_to.setToolTip("达妙/HM 使用 1~127 的 ID 查询范围；大疆不需要设置 ID，会自动监听反馈广播")
+        self.sp_to.setPrefix("查询 ID 1~")
+        self.sp_to.setToolTip("达妙/HM、高擎 GD 共用查询 ID 范围（GD 最大 126）；大疆自动监听反馈广播")
         self.prog = QProgressBar()
         self.prog.setTextVisible(True)
         self.prog.setFormat("")
@@ -244,9 +243,9 @@ class MotorListPanel(QGroupBox):
         self._update_selection_style()
 
     def on_state(self, s: dict):
-        busy = s["active"] or s["scanning"]
+        busy = s["active"] or s["scanning"] or s.get("gd_busy", False)
         self.btn_scan.setEnabled(not busy)
-        self.btn_use.setEnabled(self.worker is not None and not s["active"])
+        self.btn_use.setEnabled(self.worker is not None and not busy)
         self.btn_scan.setToolTip("请先失能" if s["active"] else self.btn_scan.toolTip())
         self._update_action_button()
 
@@ -281,7 +280,8 @@ class MotorListPanel(QGroupBox):
                 p = "dji" if m in dji.MODELS else e["protocol"]
                 opts.append((p, m, mid))
             for p, m in ALL_MODELS:          # 允许用户改选任意协议
-                if p == e["protocol"] and not any(o[1] == m for o in opts):
+                valid_id = not (p == "dji" and e["motor_id"] not in dji.MODELS[m].ids)
+                if p == e["protocol"] and valid_id and not any(o[1] == m for o in opts):
                     opts.append((p, m, e["motor_id"]))
             selected = (e["protocol"], e["model"], e["motor_id"])
             if selected in opts:
@@ -292,6 +292,7 @@ class MotorListPanel(QGroupBox):
                     "M3508 (C620)": "M3508/C620",
                     "M2006 (C610)": "M2006/C610",
                     "GM6020 (电流模式)": "GM6020",
+                    "RM 6623": "RM 6623",
                 }.get(m, m)
                 cb.addItem(short_model, (p, m, mid))
                 cb.setItemData(cb.count() - 1, f"{PROTOCOLS[p][0]} · {m}", Qt.ToolTipRole)
@@ -412,6 +413,8 @@ class MotorListPanel(QGroupBox):
             e["fb_id"] = dji.MODELS[m].fb_base + mid
         elif e.get("master_id") is not None:
             e["fb_id"] = e["master_id"]
+        elif p == "gd":
+            e["fb_id"] = 0x10000 | (mid << 8)
         candidates = [(m0, mid0) for m0, mid0 in e.get("candidates", [])
                       if not (m0 == m and mid0 == mid)]
         e["candidates"] = [(m, mid), *candidates]

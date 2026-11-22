@@ -32,7 +32,7 @@ class ScanLogTab(QWidget):
         self._row_by_key: dict[tuple, int] = {}
         self._bus_bits: deque[tuple[float, int]] = deque()
         self._feedback_times: deque[float] = deque()
-        self._fps_id = 0x202
+        self._feedback_id: int | None = None
         self._last_log_scroll_t = 0.0
 
         lg = QGroupBox("报文日志")
@@ -45,8 +45,8 @@ class ScanLogTab(QWidget):
         self.chk_aggregate.setChecked(True)
         self.lbl_load = QLabel("总线负载率：—")
         self.lbl_load.setToolTip("最近 1 秒经典 CAN 帧负载估算，包含位填充和帧间隔")
-        self.lbl_fps = QLabel("反馈帧率 0x202：—")
-        self.lbl_fps.setToolTip("最近 1 秒收到的目标反馈帧数量")
+        self.lbl_fps = QLabel("反馈帧率：—")
+        self.lbl_fps.setToolTip("自动统计当前选中电机最近 1 秒收到的反馈帧数量")
         self.ed_filter = QLineEdit()
         self.ed_filter.setPlaceholderText("过滤 ID（十六进制，逗号分隔，如 7FF,0,201）")
         self.btn_clear = QPushButton("清空")
@@ -191,12 +191,14 @@ class ScanLogTab(QWidget):
         if worker:
             worker.log_enabled = self.chk_log.isChecked()
         self.driver = None
-        self._fps_id = 0x202
+        self._feedback_id = None
+        self._feedback_times.clear()
 
     def set_driver(self, d):
         self.driver = d
-        self._fps_id = getattr(d, "fb_id", 0x202) if d is not None else 0x202
-        self.lbl_fps.setText(f"反馈帧率 0x{self._fps_id:03X}：—")
+        self._feedback_id = self._driver_feedback_id(d)
+        self._feedback_times.clear()
+        self.lbl_fps.setText(self._fps_text("—"))
         if d is None:
             self._stop_auto()
         if d is None:
@@ -209,7 +211,7 @@ class ScanLogTab(QWidget):
         self._bus_bits.clear()
         self._feedback_times.clear()
         self.lbl_load.setText("总线负载率：—")
-        self.lbl_fps.setText(f"反馈帧率 0x{self._fps_id:03X}：—")
+        self.lbl_fps.setText(self._fps_text("—"))
         self.bars.setOpts(x=[], height=[])
         self.lbl_lat.setText("—")
         if self.worker is not None:
@@ -232,7 +234,7 @@ class ScanLogTab(QWidget):
             self.lbl_load.setText(f"总线负载率：{load:.1f}%（估算）")
         else:
             self.lbl_load.setText("总线负载率：—")
-        self.lbl_fps.setText(f"反馈帧率 0x{self._fps_id:03X}：{len(self._feedback_times):.0f} FPS")
+        self.lbl_fps.setText(self._fps_text(f"{len(self._feedback_times):.0f} FPS"))
         xs = np.array(list(w.latencies))
         if len(xs) < 2:
             self.lbl_lat.setText("暂无数据（大疆为主动广播，无往返延迟）" if self.driver and
@@ -254,6 +256,43 @@ class ScanLogTab(QWidget):
         pcan_bitrates = {0x0014: 1_000_000, 0x0016: 800_000,
                          0x001C: 500_000, 0x011C: 250_000, 0x031C: 125_000}
         return pcan_bitrates.get(getattr(bus, "baud", None))
+
+    @staticmethod
+    def _driver_feedback_id(driver) -> int | None:
+        """返回驱动声明的反馈 CAN ID；不同协议字段名称不同。"""
+        if driver is None:
+            return None
+        if hasattr(driver, "fb_id"):
+            return int(driver.fb_id)
+        if hasattr(driver, "master_id"):
+            return int(driver.master_id)
+        return None
+
+    def _fps_text(self, value: str) -> str:
+        if self._feedback_id is None:
+            return f"反馈帧率：{value}"
+        return f"反馈帧率 0x{self._feedback_id:03X}：{value}"
+
+    def _is_selected_feedback(self, frame) -> bool:
+        """判断一帧是否是当前选中电机的反馈帧。"""
+        if frame.tx or self.driver is None:
+            return False
+        driver = self.driver
+        if frame.extended != driver.extended or frame.rtr:
+            return False
+        if self._feedback_id is not None and frame.can_id != self._feedback_id:
+            return False
+        try:
+            if not driver.accepts(frame.can_id, frame.data):
+                return False
+            feedback = driver.parse(frame.can_id, frame.data)
+        except (IndexError, TypeError, ValueError):
+            return False
+        if feedback is None:
+            return False
+        # 达妙/HM 的多个电机可能共用同一个反馈 CAN ID，继续用状态帧里的
+        # motor_id4 区分当前选中的电机；DJI 的反馈 ID 已经包含电机 ID。
+        return getattr(feedback, "motor_id", driver.motor_id) == driver.motor_id
 
     @staticmethod
     def _frame_bits(frame) -> int:
@@ -362,7 +401,9 @@ class ScanLogTab(QWidget):
         try:
             for index, f in enumerate(frames):
                 self._bus_bits.append((f.t, self._frame_bits(f)))
-                if not f.tx and f.can_id == self._fps_id:
+                if self._is_selected_feedback(f):
+                    if self._feedback_id is None:
+                        self._feedback_id = f.can_id
                     self._feedback_times.append(f.t)
                 if index < display_start:
                     continue

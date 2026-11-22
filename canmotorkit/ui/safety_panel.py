@@ -182,8 +182,10 @@ class SafetyPanel(QGroupBox):
         defaults = SafetyLimits()
         ui_vel_max = 50.0
         ui_out_max = min(20.0, max(0.0, float(d.out_max)))
+        self.sp_current.setRange(0.0, max(1000.0, float(d.out_max)))
+        out_unit = d.out_unit if self._output_kind == "current" else "Nm"
         self._fill_spin(self.sp_vel, ui_vel_max, "± ", " rad/s")
-        self._fill_spin(self.sp_current, ui_out_max, "± ", " A",
+        self._fill_spin(self.sp_current, ui_out_max, "± ", f" {out_unit}",
                         active=self._output_kind == "current")
         self._fill_spin(self.sp_torque, ui_out_max, "± ", " Nm",
                         active=self._output_kind == "torque")

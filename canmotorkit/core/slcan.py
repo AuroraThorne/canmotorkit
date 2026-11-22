@@ -176,13 +176,16 @@ class SlcanBus(CanBus):
         if chunk:
             self._rx.extend(chunk)
         out = []
+        batch_t = time.perf_counter()
         while b"\r" in self._rx:
             raw, _, rest = self._rx.partition(b"\r")
             self._rx = bytearray(rest)
             decoded = parse_slcan_frame(raw, with_flags=True)
             if decoded is not None:
                 can_id, data, extended, rtr, dlc = decoded
-                out.append(Frame(time.perf_counter(), can_id, data,
+                # 串口帧本身没有硬件时间戳；同一批 read() 取出的帧统一使用
+                # 批次时间，避免循环解析多帧时人为制造微秒级帧间隔。
+                out.append(Frame(batch_t, can_id, data,
                                  extended=extended, rtr=rtr, dlc=dlc))
         return out
 

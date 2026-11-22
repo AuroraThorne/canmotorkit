@@ -21,7 +21,7 @@ class ConnectionPanel(QGroupBox):
         super().__init__("① CAN 连接", parent)
         self.pcan_error = ""
         self.cb_channel = SelectedFirstComboBox()
-        self.cb_channel.setToolTip("「演示台」包含 HM9816G9、达妙 J8009P、大疆 M3508/M2006/GM6020 虚拟电机")
+        self.cb_channel.setToolTip("「演示台」包含 HM9816G9、达妙 J8009P/J4340/J4310/J6006、大疆 M3508/M2006/GM6020/6623、高擎 GD 虚拟电机")
         self.btn_refresh = QPushButton("刷新")
         row = QWidget()
         h = QHBoxLayout(row)

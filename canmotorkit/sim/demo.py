@@ -3,6 +3,8 @@
 用途：演示软件功能、自测。涵盖：
 - HM9816G9（ID 1 / Master 0x00）：HM 寄存器集，p_max=π（与实机一致），静摩擦约 0.8 Nm
 - 达妙 J8009P（ID 3 / Master 0x13）：达妙寄存器集，p_max=12.5
+- 达妙 J4340（ID 2 / Master 0x12）、J4310（ID 4 / Master 0x14）：达妙寄存器集
+- 达妙 J6006-2EC（ID 5 / Master 0x15）：达妙寄存器集
 - 大疆 M3508/C620（ID 1，反馈 0x201）、M2006/C610（ID 2，反馈 0x202）、GM6020 电流模式（ID 2，反馈 0x206）
 物理模型在输出轴侧：J·a = k·u − b·v − 库仑摩擦（含静摩擦）；应答有约 1 ms 延迟。
 """
@@ -16,7 +18,7 @@ import time
 from dataclasses import dataclass
 
 from ..core.bus import BusError, CanBus, Frame
-from ..drivers import dji
+from ..drivers import dji, gd
 from ..drivers import dm_protocol as P
 
 
@@ -171,6 +173,7 @@ class DjiSimMotor:
         self.motor_id = motor_id
         self.plant = plant
         self.cur = 0.0
+        self._cmd_raw = 0
         self.last_cmd_t = 0.0
         self.temp = 32.0
 
@@ -181,9 +184,14 @@ class DjiSimMotor:
     def handle(self, can_id: int, d: bytes, now: float) -> list[tuple[int, bytes]]:
         cid, slot = (self.m.ctrl_lo, self.motor_id - 1) if self.motor_id <= 4 else (
             self.m.ctrl_hi, self.motor_id - 5)
+        if self.m.zero_based_id:
+            cid, slot = ((self.m.ctrl_lo, self.motor_id) if self.motor_id < 4 else
+                         (self.m.ctrl_hi, self.motor_id - 4))
         if can_id == cid and len(d) >= 2 * slot + 2:
             raw = int.from_bytes(d[2 * slot:2 * slot + 2], "big", signed=True)
-            self.cur = max(-1.0, min(1.0, raw / self.m.raw_max)) * self.m.amp_max
+            self._cmd_raw = max(-self.m.raw_max, min(self.m.raw_max, raw))
+            self.cur = (self._cmd_raw if self.m.feedback_format == "6623" else
+                        max(-1.0, min(1.0, raw / self.m.raw_max)) * self.m.amp_max)
             self.last_cmd_t = now
         return []
 
@@ -197,6 +205,12 @@ class DjiSimMotor:
         gr = self.m.gr
         rotor = (self.plant.pos * gr) % (2 * math.pi)
         ang = int(rotor / (2 * math.pi) * 8192) % 8192
+        if self.m.feedback_format == "6623":
+            actual = int(round(self.cur + random.gauss(0, 10)))
+            actual = max(-32768, min(32767, actual))
+            command = max(-32768, min(32767, int(self._cmd_raw)))
+            return (ang.to_bytes(2, "big") + actual.to_bytes(2, "big", signed=True) +
+                    command.to_bytes(2, "big", signed=True) + bytes(2))
         rpm = int(round(self.plant.vel * gr * 60 / (2 * math.pi)))
         rpm = max(-32768, min(32767, rpm))
         cur = int(round(self.cur / self.m.amp_max * self.m.raw_max + random.gauss(0, 20)))
@@ -206,14 +220,127 @@ class DjiSimMotor:
                 cur.to_bytes(2, "big", signed=True) + bytes([temp, 0]))
 
 
+class GdSimMotor:
+    """经典 CAN GD 演示模型；不代表某一具体型号的机械参数。"""
+
+    def __init__(self, motor_id=6, model_text="5036_02"):
+        self.motor_id = motor_id
+        self.driver = gd.GdDriver(motor_id=motor_id)
+        self.plant = Plant(J=0.008, b=0.04, fc=0.02, fs=0.03)
+        self.cmd = P.MitCommand()
+        self.torque = 0.0
+        self.error = 0
+        self.offset = 0.0
+        self.stopped = True
+        self.model_text = model_text
+        self.period_us = 0
+        self.next_feedback = 0.0
+        self.saved = False
+        self.mode = "torque"
+        self.values = {}
+
+    def status(self):
+        # 独立按文档 int16 刻度生成状态，位置跨 int16 边界回绕。
+        import struct
+        pos = round((self.plant.pos - self.offset) / gd.TAU * 10000)
+        pos = (pos + 32768) % 65536 - 32768
+        vel = max(-32768, min(32767, round(self.plant.vel / gd.TAU * 4000)))
+        torque = max(-32768, min(32767, round(self.torque * 100)))
+        return bytes((gd.QUERY_STATUS, self.error)) + struct.pack("<hhh", pos, vel, torque)
+
+    def step(self, dt, now):
+        c = self.cmd
+        if self.mode in ("velocity", "position", "position_velocity_torque"):
+            v = self.values
+            target_v = v.get("velocity", 0.0)
+            if self.mode != "velocity":
+                target_v = (v["position"] - (self.plant.pos - self.offset)) * 4
+                limit = v.get("velocity", 10)
+                target_v = P.clamp(target_v, -limit, limit)
+            limit = v.get("torque", 100)
+            torque = P.clamp((target_v - self.plant.vel) * 0.3, -limit, limit)
+        elif self.mode == "brake":
+            torque = -self.plant.vel * 0.3
+        else:
+            torque = (c.t + c.kp * (c.p - (self.plant.pos - self.offset)) / gd.TAU
+                      + c.kd * (c.v - self.plant.vel) / gd.TAU)
+        self.torque = 0.0 if self.stopped or self.error else torque
+        self.torque = P.clamp(self.torque, -100, 100)
+        self.plant.step(self.torque, dt)
+
+    def handle(self, can_id, data, now):
+        import struct
+        if can_id == gd.MIT_BASE | self.motor_id and len(data) == 8:
+            self.cmd = gd.unpack_mit(data)
+            self.mode = "mit"
+            self.stopped = False
+            return []
+        if can_id != self.driver.tx_id or len(data) < 2:
+            return []
+        mode, query = data[:2]
+        if mode == 0 and query in (4, 5, 7):
+            reply = (bytes((query, 8, 1, 0)) if query in (4, 5) else
+                     bytes((7, len(self.model_text))) + self.model_text.encode("ascii")[:6])
+            return [(self.driver.fb_id, reply)]
+        if mode == 3:
+            if data[:4] == bytes((3, 0, 5, 0x0E)) and len(data) == 8:
+                self.period_us = int.from_bytes(data[4:], "little")
+                return []
+            if len(data) < 3 or query != 3:
+                return []
+            if data[2] == 1:
+                self.stopped = True
+                self.cmd = P.MitCommand()
+                self.period_us = 0
+                return []
+            if data[2] == 2:
+                self.saved = True
+            elif data[2] == 3:
+                self.offset = self.plant.pos
+            elif data[2] == 4 and len(data) == 4:
+                self.motor_id = data[3]
+                self.driver = gd.GdDriver(motor_id=self.motor_id)
+            else:
+                return [(self.driver.fb_id, bytes((3, 1)))]
+            return [(self.driver.fb_id, bytes((3, 0)))]
+        if mode == 0x1B and len(data) == 4:
+            self.cmd = P.MitCommand(t=struct.unpack_from("<h", data, 2)[0] / 100)
+            self.mode = "torque"
+            self.stopped = False
+        elif mode == 0x01:
+            self.cmd = P.MitCommand()
+            self.stopped = True
+        elif mode == 0x18:
+            self.mode = "brake"
+            self.stopped = False
+        elif mode in (0x1C, 0x1D) and len(data) == 4:
+            self.mode = "velocity" if mode == 0x1C else "position"
+            self.values = {self.mode: struct.unpack_from("<h", data, 2)[0] * gd.TAU / (4000 if mode == 0x1C else 10000)}
+            self.stopped = False
+        elif mode == 0x1F and len(data) == 8:
+            p, v, t = struct.unpack_from("<hhh", data, 2)
+            self.mode = "position_velocity_torque"
+            self.values = dict(position=p * gd.TAU / 10000, velocity=v * gd.TAU / 4000, torque=t / 100)
+            self.stopped = False
+        if query == gd.QUERY_STATUS:
+            return [(self.driver.fb_id, self.status())]
+        return []
+
+
 # ============================ 虚拟总线 ============================
 def default_motors() -> list:
     return [
         DmSimMotor("hm", 1, 0x00, math.pi, 45.0, 54.0, Plant(J=0.006, b=0.02, fc=0.6, fs=0.8)),
         DmSimMotor("dm", 3, 0x13, 12.5, 45.0, 54.0, Plant(J=0.006, b=0.03, fc=0.5, fs=0.7)),
+        DmSimMotor("dm", 2, 0x12, 12.5, 45.0, 54.0, Plant(J=0.004, b=0.025, fc=0.4, fs=0.6)),
+        DmSimMotor("dm", 4, 0x14, 12.5, 45.0, 54.0, Plant(J=0.004, b=0.025, fc=0.4, fs=0.6)),
+        DmSimMotor("dm", 5, 0x15, 12.5, 45.0, 54.0, Plant(J=0.003, b=0.02, fc=0.35, fs=0.5)),
         DjiSimMotor("M3508 (C620)", 1, Plant(J=0.002, b=0.004, fc=0.08, fs=0.1, k=0.3)),
         DjiSimMotor("M2006 (C610)", 2, Plant(J=0.0008, b=0.002, fc=0.03, fs=0.04, k=0.18)),
         DjiSimMotor("GM6020 (电流模式)", 2, Plant(J=0.003, b=0.01, fc=0.05, fs=0.07, k=0.741)),
+        DjiSimMotor("RM 6623", 0, Plant(J=0.003, b=0.01, fc=0.05, fs=0.07, k=0.0002)),
+        GdSimMotor(6),
+        GdSimMotor(7, "6036_02"),
     ]
 
 
@@ -224,7 +351,7 @@ class DemoBus(CanBus):
         self.name = "演示台"
         self.motors = default_motors() if motors is None else motors
         self.latency = latency
-        self._q: list[tuple[float, int, int, bytes]] = []
+        self._q: list[tuple[float, int, int, bytes, bool]] = []
         self._seq = 0
         self._lock = threading.Lock()
         self._run = False
@@ -243,9 +370,9 @@ class DemoBus(CanBus):
         if self._th:
             self._th.join(timeout=1)
 
-    def _push(self, t: float, can_id: int, data: bytes):
+    def _push(self, t: float, can_id: int, data: bytes, extended: bool = False):
         self._seq += 1
-        heapq.heappush(self._q, (t, self._seq, can_id, data))
+        heapq.heappush(self._q, (t, self._seq, can_id, data, extended))
 
     def _loop(self) -> None:
         last = time.perf_counter()
@@ -260,6 +387,9 @@ class DemoBus(CanBus):
                 for m in self.motors:
                     for _ in range(n):
                         m.step(dt / n, now)
+                    if isinstance(m, GdSimMotor) and m.period_us >= 100 and now >= m.next_feedback:
+                        m.next_feedback = now + m.period_us / 1_000_000
+                        self._push(now, m.driver.fb_id, m.status(), extended=True)
                 if now >= next_fb:
                     next_fb = max(next_fb + 0.001, now - 0.005)
                     for m in self.motors:
@@ -273,14 +403,16 @@ class DemoBus(CanBus):
         with self._lock:
             now = time.perf_counter()
             for m in self.motors:
+                if rtr or extended != isinstance(m, GdSimMotor):
+                    continue
                 for rid, rd in m.handle(can_id, bytes(data), now):
-                    self._push(now + self.latency * random.uniform(0.8, 1.6), rid, rd)
+                    self._push(now + self.latency * random.uniform(0.8, 1.6), rid, rd, extended)
 
     def recv_all(self) -> list[Frame]:
         now = time.perf_counter()
         out = []
         with self._lock:
             while self._q and self._q[0][0] <= now:
-                t, _, cid, d = heapq.heappop(self._q)
-                out.append(Frame(t, cid, d))
+                t, _, cid, d, extended = heapq.heappop(self._q)
+                out.append(Frame(t, cid, d, extended=extended))
         return out

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QFormLayout, QGro
 from canmotorkit.drivers import dm_protocol as P
 
 from .widgets import CheckBox
+from .gd_panel import GdSettings
 
 C_RID, C_NAME, C_SRC, C_TYPE, C_VAL, C_NEW, C_RESP, C_DESC = range(8)
 HEAD = ["RID", "名称", "来源", "类型", "当前值", "新值（双击编辑）", "实测", "说明"]
@@ -82,7 +83,7 @@ class RegisterTab(QWidget):
         self.btn_save = QPushButton("保存到 Flash")
         self.btn_save.setStyleSheet("QPushButton{font-weight:bold}")
         self.btn_save.setToolTip("AA 01；仅失能时生效；Flash 擦写约 1 万次，请勿频繁保存")
-        self.btn_change_id = QPushButton("修改 ID…")
+        self.btn_change_id = QPushButton("修改ID")
         self.btn_limits = QPushButton("重读量程")
         self.btn_export = QPushButton("导出 JSON")
         self.btn_import = QPushButton("导入 JSON")
@@ -92,20 +93,15 @@ class RegisterTab(QWidget):
             bar.addWidget(b)
         bar.addStretch(1)
         bar.addWidget(self.chk_family)
-        note = QLabel("写入立即生效但不存储（达妙文档），需「保存到 Flash」才掉电保持；HM 是否一致待实测。"
-                      "控制模式、波特率、标定值等在本软件中只读。")
-        note.setWordWrap(True)
-        note.setProperty("themeRole", "note")
         self.lbl = QLabel()
         self.lbl.setProperty("themeRole", "muted")
         self.reg_box = QWidget()
         rl = QVBoxLayout(self.reg_box)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.addLayout(bar)
-        rl.addWidget(note)
         rl.addWidget(self.table, 1)
         rl.addWidget(self.lbl)
-        self.lbl_noreg = QLabel("当前协议不支持参数读写（大疆电调的参数需使用 RoboMaster Assistant）。")
+        self.lbl_noreg = QLabel("当前型号不支持通过 CAN 参数读写，请使用厂家调试工具配置。")
         self.lbl_noreg.setProperty("themeRole", "muted")
         self.lbl_noreg.setStyleSheet("padding:20px")
 
@@ -113,6 +109,8 @@ class RegisterTab(QWidget):
         lay.addWidget(cg)
         lay.addWidget(self.reg_box, 1)
         lay.addWidget(self.lbl_noreg)
+        self.gd = GdSettings()
+        lay.addWidget(self.gd, 1)
 
         self.btn_read_all.clicked.connect(self.read_all)
         self.btn_read_sel.clicked.connect(self._read_sel)
@@ -157,6 +155,12 @@ class RegisterTab(QWidget):
 
     def set_driver(self, d):
         self.driver = d
+        is_gd = d is not None and d.protocol == "gd"
+        self.gd.bind(self.worker, d)
+        self.gd.setVisible(is_gd)
+        self.lbl_noreg.setText("当前型号不支持通过 CAN 参数读写，请使用厂家调试工具配置。")
+        self._lim_warning = False
+        self._refresh_limit_style()
         self.values.clear()
         self.table.blockSignals(True)
         for i in range(self.table.rowCount()):
@@ -168,7 +172,7 @@ class RegisterTab(QWidget):
         self.table.blockSignals(False)
         has_reg = d is not None and d.caps.registers
         self.reg_box.setVisible(has_reg or d is None)
-        self.lbl_noreg.setVisible(d is not None and not has_reg)
+        self.lbl_noreg.setVisible(d is not None and not has_reg and not is_gd)
         for b in (self.btn_read_all, self.btn_read_sel, self.btn_write, self.btn_save,
                   self.btn_change_id, self.btn_limits):
             b.setEnabled(has_reg)
@@ -180,11 +184,20 @@ class RegisterTab(QWidget):
         if has_reg:
             self.lbl_ids.setText(f"电机 ID {d.motor_id}（控制帧 ID），Master 0x{d.master_id:X}（反馈帧 ID）")
             self.lbl_extra.setText(d.note or "—")
+        elif d.protocol == "dm":
+            self.lbl_ids.setText(f"电机 ID {d.motor_id}（控制帧 ID），Master 0x{d.master_id:X}（反馈帧 ID）")
+            self.lbl_lim.setText("p ±12.5 rad，v ±45 rad/s，t ±54 Nm，kp 0~500，kd 0~5（型号默认量程）")
+            self.lbl_extra.setText((d.note or "") + "；当前型号不支持通过 CAN 读取参数")
+        elif d.protocol == "gd":
+            self.lbl_ids.setText(f"电机 ID {d.motor_id}：控制 0x{d.tx_id:05X}，MIT 0x{0x58000 | d.motor_id:05X}，反馈 0x{d.fb_id:05X}（扩展帧）")
+            self.lbl_lim.setText("协议输出范围 ±100 Nm（非额定扭矩）；状态位置 0.0001 圈/LSB，速度 0.00025 圈/s/LSB")
+            self.lbl_extra.setText(d.note)
+            self.lbl_noreg.setText("GD 协议未定义此寄存器表，请使用厂家工具配置。")
         else:
             cid, slot = d.ctrl
             self.lbl_ids.setText(f"电调 ID {d.motor_id}：反馈 0x{d.fb_id:03X}，控制帧 0x{cid:03X} 第 {slot + 1} 槽")
             m = d.m
-            self.lbl_lim.setText(f"电流 ±{m.amp_max:g} A（原始 ±{m.raw_max}），减速比 {m.gr:.6g}（位置/速度换算到输出轴）")
+            self.lbl_lim.setText(f"电流 ±{m.amp_max:g} {d.out_unit}（原始 ±{m.raw_max}），减速比 {m.gr:.6g}（位置/速度换算到输出轴）")
             self.lbl_extra.setText((d.note + "；" if d.note else "") +
                                    "同一控制帧其余槽位填 0，会把同组其它电机电流置 0")
         self._filter_rows()
@@ -192,10 +205,12 @@ class RegisterTab(QWidget):
     def set_limits(self, lim: P.Limits, from_motor: bool):
         if self.driver is None or not self.driver.caps.registers:
             return
-        src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
+        no_can_limits = self.driver is not None and getattr(self.driver, "limits_from_motor", True) is False
+        src = ("默认量程（该型号不支持 CAN 读取）" if no_can_limits else
+               ("来自电机" if from_motor else "未读取（默认值，禁止使能）"))
         self.lbl_lim.setText(f"p ±{lim.p_max:.7g} rad，v ±{lim.v_max:.7g} rad/s，t ±{lim.t_max:.7g} Nm，"
                              f"kp 0~{lim.kp_max:g}，kd 0~{lim.kd_max:g}（{src}）")
-        self._lim_warning = not from_motor
+        self._lim_warning = not from_motor and not no_can_limits
         self._refresh_limit_style()
 
     def _refresh_limit_style(self):
@@ -204,6 +219,7 @@ class RegisterTab(QWidget):
         )
 
     def on_state(self, s: dict):
+        self.gd.on_state(s)
         b = s["blocked"]
         if b != self.blocked:
             self.blocked = b
@@ -216,6 +232,9 @@ class RegisterTab(QWidget):
 
     def read_all(self):
         if not self.worker:
+            return
+        if self.blocked:
+            self.lbl.setText("电机使能中，请先失能后再读取参数")
             return
         n = 0
         for i, r in enumerate(P.REGISTERS):
@@ -264,6 +283,13 @@ class RegisterTab(QWidget):
         self.table.blockSignals(False)
         self.lbl.setText(f"✔ {kind} 0x{rid:02X} {reg.name} = {fmt(reg.typ, value)}")
 
+    def on_gd_done(self, kind, value, error):
+        self.gd.on_done(kind, value, error)
+        if not error and self.driver is not None and self.driver.protocol == "gd":
+            self.lbl_proto.setText(f"{self.driver.protocol_name} · {self.driver.model}")
+            d = self.driver
+            self.lbl_ids.setText(f"电机 ID {d.motor_id}：控制 0x{d.tx_id:05X}，MIT 0x{0x58000 | d.motor_id:05X}，反馈 0x{d.fb_id:05X}（扩展帧）")
+
     # ---------- 内部 ----------
     def _filter_rows(self):
         fam = getattr(self.driver, "family", "both")
@@ -277,6 +303,9 @@ class RegisterTab(QWidget):
             it.setBackground(QBrush(color) if it.text().strip() else QBrush())
 
     def _read_sel(self):
+        if self.blocked:
+            self.lbl.setText("电机使能中，请先失能后再读取参数")
+            return
         for r in sorted({i.row() for i in self.table.selectedIndexes()}):
             self.worker.read_reg(P.REGISTERS[r].rid)
 

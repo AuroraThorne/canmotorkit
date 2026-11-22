@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QDoubleSpinBox, QFormLayout, QGridLayout, QGroupB
                                QWidget, QSizePolicy)
 
 from canmotorkit.drivers import dm_protocol as P
+from .gd_panel import GdControl
 
 
 
@@ -38,15 +39,21 @@ class _Row:
         self.spin.setDecimals(decimals)
         self.spin.setSingleStep(step)
         self.spin.setKeyboardTracking(True)
-        self.spin.setMinimumWidth(110)
-        self.spin.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        # 单位直接显示在数值框内部，避免一行被拆成多个灰色小框。
+        # 数值框保持紧凑，窄栏时仍优先压缩滑条。
+        self.spin.setFixedWidth(96)
+        self.spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.spin.setStyleSheet(_spin_style(True))
         self.slider.setMinimumWidth(0)
         self.spin.setSuffix(f" {unit}" if unit else "")
         self.btn0 = QToolButton()
         self.btn0.setText("0")
         self.btn0.setFocusPolicy(Qt.NoFocus)
-        grid.addWidget(QLabel(label), row, 0)
+        self.btn0.setFixedWidth(32)
+        title = QLabel(label)
+        # 所有 MIT 参数共用这一套紧凑行布局，避免某个型号单独撑宽。
+        title.setFixedWidth(60)
+        grid.addWidget(title, row, 0)
         grid.addWidget(self.slider, row, 1)
         if place_spin:
             grid.addWidget(self.spin, row, 2)
@@ -118,6 +125,11 @@ class _Params(QWidget):
         self._output_enabled = False
         self.rows = {}
         grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setColumnMinimumWidth(0, 60)
+        grid.setColumnMinimumWidth(2, 96)
+        grid.setColumnMinimumWidth(3, 32)
         grid.setColumnStretch(1, 1)
         single_output = len(specs) == 1
         for i, (k, label, unit, dec, step) in enumerate(specs):
@@ -135,7 +147,7 @@ class _Params(QWidget):
         if single_output:
             # 单输出页的置零操作与应用放在同一行，避免挤压输出数值框。
             output_row = next(iter(self.rows.values()))
-            output_row.spin.setFixedWidth(110)
+            output_row.spin.setFixedWidth(96)
             output_row.spin.setFixedHeight(28)
             output_row.spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             output_row.btn0.setFixedHeight(28)
@@ -222,7 +234,7 @@ class ControlPanel(QWidget):
         # MIT 子页
         self.mit = _Params([("p", "位置 p", "rad", 4, 0.01), ("v", "速度 v", "rad/s", 3, 0.1),
                             ("kp", "Kp", "", 2, 1.0), ("kd", "Kd", "", 3, 0.05),
-                            ("t", "前馈扭矩 t", "Nm", 3, 0.1)], self._apply_mit)
+                            ("t", "前馈", "Nm", 3, 0.1)], self._apply_mit)
         self.lbl_lim = QLabel("—")
         self.lbl_lim.setWordWrap(True)
         pm = QWidget()
@@ -233,15 +245,14 @@ class ControlPanel(QWidget):
         f = QFormLayout()
         f.addRow("当前量程", self.lbl_lim)
         lm.addLayout(f)
-        tip = QLabel("MIT 模式下，前馈扭矩 t 同样受左侧「电流/扭矩限幅」限制；位置/速度环由驱动器完成。")
-        tip.setWordWrap(True)
-        tip.setProperty("themeRole", "muted")
-        lm.addWidget(tip)
         lm.addStretch(1)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(pc, "电流 / 扭矩")
         self.tabs.addTab(pm, "MIT")
+        self.gd = GdControl()
+        self.tabs.addTab(self.gd, "GD 控制")
+        self.tabs.setTabVisible(2, False)
         self.tabs.currentChanged.connect(self._tab_changed)
 
         rg = QGroupBox("实时反馈")
@@ -287,6 +298,9 @@ class ControlPanel(QWidget):
         self.driver = d
         self._safety_out_max = None
         self._active = False
+        self.gd.bind(self.worker, d)
+        self.tabs.setTabVisible(2, d is not None and d.protocol == "gd")
+        self.tabs.setCurrentIndex(0)
         self.cur.reset_zero()
         self.mit.reset_zero()
         has_mit = d is not None and d.caps.mit
@@ -310,12 +324,17 @@ class ControlPanel(QWidget):
         r = self.cur.rows["out"]
         r.spin.setSuffix(f" {d.out_unit}")
         self._update_output_range()
+        if d.protocol == "gd":
+            self.set_limits(d.lim, True)
+        self.mit.rows["kp"].spin.setToolTip("GD 原生 Kp，位置误差按圈计算" if d.protocol == "gd" else "")
+        self.mit.rows["kd"].spin.setToolTip("GD 原生 Kd，速度误差按圈/s计算" if d.protocol == "gd" else "")
         self._tab_changed(self.tabs.currentIndex())
         self._update_feedback_rows()
 
     def on_state(self, s: dict):
         """同步 Worker 的实际输出状态，控制参数下发权限。"""
         active = bool(s.get("active", False))
+        self.gd.on_state(s)
         if self._active and not active:
             # 停止输出后清掉界面和后台目标，重新使能必须从零开始。
             self.cur.reset_zero()
@@ -341,10 +360,13 @@ class ControlPanel(QWidget):
         r["t"].set_range(lim.t_min, lim.t_max)
         if self.driver is not None and self.driver.caps.mit:
             self._update_output_range()
-        src = "来自电机" if from_motor else "未读取（默认值，禁止使能）"
-        self.lbl_lim.setText(f"p ±{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
-                             f"kp 0~{lim.kp_max:g}  kd 0~{lim.kd_max:g}（{src}）")
-        self._lim_warning = not from_motor
+        no_can_limits = self.driver is not None and getattr(self.driver, "limits_from_motor", True) is False
+        src = ("默认量程（该型号不支持 CAN 读取）" if no_can_limits else
+               ("来自电机" if from_motor else "未读取（默认值，禁止使能）"))
+        src = getattr(self.driver, "limits_source", src)
+        self.lbl_lim.setText(f"p {lim.p_min:.7g}~{lim.p_max:.7g}  v ±{lim.v_max:.7g}  t ±{lim.t_max:.7g}\n"
+                             f"kp {lim.kp_min:g}~{lim.kp_max:g}  kd {lim.kd_min:g}~{lim.kd_max:g}（{src}）")
+        self._lim_warning = not from_motor and not no_can_limits
         self._refresh_limit_style()
 
     def set_output_limit(self, limit: float | None):
@@ -369,7 +391,7 @@ class ControlPanel(QWidget):
         fb = s.fb
         self.lbl["pos_raw"].setText(f"{fb.pos:+.4f} rad")
         self.lbl["pos_mt"].setText(f"{s.pos_mt:+.4f} rad")
-        self.lbl["vel"].setText(f"{fb.vel:+.3f} rad/s")
+        self.lbl["vel"].setText("—" if fb.vel != fb.vel else f"{fb.vel:+.3f} rad/s")
         cmd = "—" if s.out != s.out else f"{s.out:+.3f}"
         self.lbl["out"].setText(f"{cmd} / {fb.out:+.3f} {d.out_unit}")
         t2 = "" if fb.temp2 != fb.temp2 else f" / {fb.temp2:.0f}"
@@ -412,4 +434,4 @@ class ControlPanel(QWidget):
 
     def _tab_changed(self, i: int):
         if self.worker is not None:
-            self.worker.set_mode("mit" if i == 1 else "current")
+            self.worker.set_mode("gd" if i == 2 else "mit" if i == 1 else "current")

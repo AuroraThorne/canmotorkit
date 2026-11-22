@@ -1,4 +1,5 @@
 """用演示台（DemoBus）对 Worker 做无界面集成测试，覆盖达妙/HM 与大疆。"""
+import math
 import time
 
 import pytest
@@ -8,9 +9,11 @@ from canmotorkit.analysis import sysid
 from canmotorkit.analysis.runs import ExciteConfig, ExciteRun, LoopConfig, LoopRun
 from canmotorkit.control.safety import SafetyLimits
 from canmotorkit.core.worker import Worker
+from canmotorkit.core.bus import Frame
 from canmotorkit.drivers import dm_protocol as P
+from canmotorkit.drivers import gd
 from canmotorkit.drivers.catalog import make_driver
-from canmotorkit.sim.demo import DemoBus, DjiSimMotor, DmSimMotor
+from canmotorkit.sim.demo import DemoBus, DjiSimMotor, DmSimMotor, GdSimMotor
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +82,19 @@ def test_dm_limits_and_registers(app, hm):
     assert d[("save", 0)] == (True, "")
 
 
+def test_dm_j6006_uses_common_mit_protocol(app):
+    driver = make_driver("dm", "DM-J6006-2EC", 5, 0x15)
+    assert driver.family == "dm"
+    assert driver.caps.mit and not driver.caps.registers
+    assert driver.ready and not driver.limits_from_motor
+    assert driver.title() == "DM-J6006-2EC  ID 5 / Master 0x15"
+    assert driver.output_frames(0.5)[0][0] == 5
+    status = P.pack_status(5, P.CODE_DISABLED, 0.2, -1.5, 0.3, 35, 36, P.DEFAULT_LIMITS)
+    fb = driver.parse(0x15, status)
+    assert fb is not None and fb.motor_id == 5
+    assert fb.vel == pytest.approx(-1.5, abs=0.02)
+
+
 def test_dm_current_mode_estop_and_disable(app, hm):
     w, bus = hm.w, hm.bus
     m = bus.motor(DmSimMotor, 1)
@@ -143,6 +159,47 @@ def test_dji_current(app):
         r.close()
 
 
+def test_dji_6623_protocol(app):
+    driver = make_driver("dji", "RM 6623", 0)
+    assert driver.ctrl == (0x1FF, 0)
+    assert driver.fb_id == 0x205
+    assert driver.encode(5000) == 5000
+    assert driver.encode(-5000) == -5000
+    frame = driver.output_frames(1234)[0]
+    assert frame == (0x1FF, bytes.fromhex("04 D2 00 00 00 00 00 00"))
+    fb = driver.parse(0x205, bytes.fromhex("10 00 04 D2 FB 2E 00 00"))
+    assert fb is not None
+    assert fb.out == 1234
+    assert fb.vel != fb.vel
+
+
+def test_dji_6623_velocity_estimate_uses_time_window(app):
+    """6623 无 RPM 字段时，角度差分应稳定且能跨过单圈边界。"""
+    driver = make_driver("dji", "RM 6623", 0)
+    w = Worker(DemoBus(), driver)
+    speeds = []
+    # 2 rad/s，1 kHz 反馈；起点放在 +π 附近，强制覆盖回绕。
+    for i in range(120):
+        pos = math.pi - 0.02 + 2.0 * i * 0.001
+        raw = int((pos % (2 * math.pi)) / (2 * math.pi) * 8192) & 0x1FFF
+        fb = w._on_rx(Frame(i * 0.001, 0x205,
+                             raw.to_bytes(2, "big") + bytes(6)))
+        if fb is not None and math.isfinite(fb.fb.vel):
+            speeds.append(fb.fb.vel)
+    assert speeds
+    assert max(abs(v - 2.0) for v in speeds[-30:]) < 0.15
+    assert max(abs(v) for v in speeds) < 10.0
+
+    # 同一批次中时间戳几乎相同的帧不能制造数千 rad/s 的尖峰。
+    w = Worker(DemoBus(), driver)
+    for i in range(20):
+        pos = 0.5 + i * 0.001
+        raw = int((pos % (2 * math.pi)) / (2 * math.pi) * 8192) & 0x1FFF
+        fb = w._on_rx(Frame(i * 0.00001, 0x205,
+                             raw.to_bytes(2, "big") + bytes(6)))
+        assert fb is None or not math.isfinite(fb.fb.vel) or abs(fb.fb.vel) < 100.0
+
+
 def test_scan_all_protocols(app):
     r = Rig(app)
     try:
@@ -151,13 +208,117 @@ def test_scan_all_protocols(app):
         got = {(x["protocol"], x["model"], x["motor_id"]) for x in r.rec["scan"]}
         assert ("dm", "HM9816G9", 1) in got
         assert ("dm", "DM-J8009P", 3) in got
+        assert ("gd", gd.MODEL_5036_FAMILY, 6) in got
+        assert ("gd", gd.MODEL_6036, 7) in got
         dji = {x["fb_id"]: x for x in r.rec["scan"] if x["protocol"] == "dji"}
-        assert set(dji) == {0x201, 0x202, 0x206}
+        assert set(dji) == {0x201, 0x202, 0x205, 0x206}
         assert dji[0x202]["model"] == "M2006 (C610)"           # 无温度 → C610
         assert dji[0x206]["model"] in ("M3508 (C620)", "GM6020 (电流模式)")
-        assert len(dji[0x206]["candidates"]) == 3                # C620/C610/GM6020 重叠
+        assert len(dji[0x206]["candidates"]) == 4                # 含 RM 6623 的重叠候选
+        assert ("RM 6623", 0) in dji[0x205]["candidates"]
         dm8 = next(x for x in r.rec["scan"] if x["motor_id"] == 3 and x["protocol"] == "dm")
         assert dm8["master_id"] == 0x13
+    finally:
+        r.close()
+
+
+def test_gd_output_mit_estop_fault_and_disable(app):
+    r = Rig(app, make_driver("gd", gd.MODEL, 6))
+    try:
+        w, m = r.w, r.bus.motor(GdSimMotor, 6)
+        w.set_sending(True)
+        assert pump(app, 1, lambda: w.last_fb is not None)
+        assert w.last_fb.code == 0 and not w.active
+        assert pump(app, 1, lambda: not w._gd_queue and w._gd_pending is None)
+        w.set_safety_limits(SafetyLimits(vel_max=100, out_max=1, temp_max=0))
+        w.enable()
+        w.set_target_out(0.2)
+        assert pump(app, 1, lambda: w.active and abs(w.last_fb.out - 0.2) < 0.02)
+        assert all(f.extended for f in w._frames if f.can_id == 0x18006)
+        w.zero_output()
+        assert pump(app, 1, lambda: m.cmd.t == 0 and w.get_target_out() == 0)
+        w.set_mode("mit")
+        w.set_target_mit(P.MitCommand(p=0.1, kp=10, kd=1))
+        assert pump(app, 1, lambda: m.cmd.kp > 9)
+        w.estop()
+        assert pump(app, 1, lambda: w.safety.tripped and m.cmd == P.MitCommand())
+        assert w.active and not m.stopped  # 急停为零扭矩，不发刹车/自由停转
+        w.set_mode("current")
+        w.reset_safety()
+        assert pump(app, 1, lambda: not w.safety.tripped)
+        run = ExciteRun(ExciteConfig(kind="step", amp=0.2, step_delay=0.02, step_on=0.08, step_tail=0.05))
+        w.start_run(run)
+        assert pump(app, 2, lambda: run.done)
+        assert not run.reason and len(run.rec.t) > 20
+        loop = LoopRun(LoopConfig(loop="vel", kp=0.05, ki=0.1, amp=0.5, duration=0.2, out_max=0.5))
+        w.start_run(loop)
+        assert pump(app, 2, lambda: loop.done)
+        assert not loop.reason and len(loop.rec.t) > 20
+        m.error = 2
+        assert pump(app, 1, lambda: w.safety.tripped and w.last_fb.code == 2)
+        w.disable()
+        assert pump(app, 1, lambda: not w.active and m.stopped)
+    finally:
+        r.close()
+
+
+@pytest.mark.parametrize("kind", ["step", "stepsine", "chirp", "prbs", "vel", "pos", "pos_single"])
+def test_gd_all_response_and_closed_loop_modes(app, kind):
+    r = Rig(app, make_driver("gd", gd.MODEL_5036, 6))
+    try:
+        w = r.w
+        assert pump(app, 1, lambda: not w._gd_queue and w._gd_pending is None)
+        w.set_safety_limits(SafetyLimits(vel_max=100, out_max=0.5, temp_max=0))
+        w.enable()
+        assert pump(app, 1, lambda: w.active and w.last_fb is not None)
+        if kind in ("vel", "pos", "pos_single"):
+            run = LoopRun(LoopConfig(loop=kind, kp=0.2, ki=0.1, kd=0.01, amp=0.05,
+                                     pos_kp=2, pos_ki=0, pos_kd=0, duration=0.15, out_max=0.5))
+        else:
+            run = ExciteRun(ExciteConfig(kind=kind, amp=0.2, f0=10, f1=20, n_freq=2,
+                                         cycles=2, min_seg=0.1, duration=0.15,
+                                         step_delay=0.01, step_on=0.08, step_tail=0.06))
+        w.start_run(run)
+        assert pump(app, 2, lambda: run.done)
+        assert not run.reason, run.reason
+        assert len(run.rec) > 15
+        assert all(abs(u) <= 0.5 for u in run.rec.u)
+        assert pump(app, 1, lambda: r.bus.motor(GdSimMotor, 6).cmd.t == 0)
+    finally:
+        r.close()
+
+
+def test_gd_settings_periodic_reboot_and_id_on_demo(app):
+    r = Rig(app, make_driver("gd", gd.MODEL, 6))
+    results = []
+    r.w.gd_done.connect(lambda k, v, e: results.append((k, v, e)))
+    try:
+        w, m = r.w, r.bus.motor(GdSimMotor, 6)
+        assert pump(app, 1, lambda: not w._gd_queue and w._gd_pending is None)
+        assert w.driver.model == gd.MODEL_5036_FAMILY
+        assert w.driver.identity['firmware'] == '0.1.8'
+        for kind, value in (("periodic", 1000), ("periodic", 0), ("save", None),
+                            ("zero", None), ("reboot", None), ("change_id", 9)):
+            count = len(results)
+            w.gd_request(kind, value)
+            assert pump(app, 2, lambda: any(item[0] == kind for item in results[count:]))
+            assert not results[-1][2], results[-1]
+            if kind == 'periodic':
+                assert m.period_us == value
+                if value:
+                    assert pump(app, 1, lambda: w.last_fb is not None)
+            if kind == 'save':
+                assert m.saved
+        assert w.driver.motor_id == 9 and m.motor_id == 9
+        w.set_sending(True)
+        assert pump(app, 1, lambda: w.last_fb is not None and w.last_fb.motor_id == 9)
+        w.enable()
+        assert pump(app, 1, lambda: w.active)
+        w.set_mode('gd')
+        w.set_gd_control('position_velocity_torque', dict(position=.1, velocity=1, torque=.4))
+        assert pump(app, 1, lambda: m.mode == 'position_velocity_torque')
+        w.zero_output()
+        assert pump(app, 1, lambda: m.mode == 'torque' and m.cmd.t == 0)
     finally:
         r.close()
 

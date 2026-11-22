@@ -634,6 +634,8 @@ class MainWindow(QMainWindow):
         w.samples.connect(self.test.on_samples)
         w.frames.connect(self.scan.on_frames)
         w.reg_done.connect(self.regs.on_reg_done)
+        w.gd_done.connect(self.regs.on_gd_done)
+        w.gd_done.connect(self._on_gd_done)
         w.scan_progress.connect(self.motors.on_scan_progress)
         w.scan_done.connect(self.motors.on_scan_done)
         w.state.connect(self._on_state)
@@ -680,6 +682,9 @@ class MainWindow(QMainWindow):
         w = self.worker
         if w is None:
             return
+        if w.configuration_busy:
+            self._on_message("GD 设置正在执行，请等待操作结束再切换电机")
+            return
         if w.active:
             QMessageBox.information(self, "切换电机", "请先失能/停止当前电机")
             return
@@ -703,6 +708,21 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(0)
 
     # ---------- 回调 ----------
+    def _on_gd_done(self, kind, value, error):
+        d = self.driver
+        if error or d is None or d.protocol != "gd":
+            return
+        if kind in ("change_id", "model"):
+            row = self.motors._debug_row
+            if row is not None and 0 <= row < len(self.motors.entries):
+                entry = self.motors.entries[row]
+                entry.update(model=d.model, motor_id=d.motor_id, fb_id=d.fb_id,
+                             candidates=[(d.model, d.motor_id)], gd_identity=dict(d.identity))
+                self.motors._refresh()
+                self.motors.set_debug_driver(d)
+            self.card.lbl_title.setText(d.model)
+            self.scan.set_driver(d)
+
     def _on_samples(self, samples):
         self.mini_plot.add_samples(samples)
         self.control.on_sample(samples[-1])
